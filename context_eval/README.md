@@ -34,3 +34,5 @@ Metrics
 
 Author:
 Context Evaluation & Memory Routing Engineer
+## Version
+v1.1 - Documentation updated.
