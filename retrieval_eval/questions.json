@@ -1,0 +1,14 @@
+[
+    {
+        "query": "What is the standard fasting protocol?",
+        "type": "general"
+    },
+    {
+        "query": "What does Protocol 4.2b say about cardiac risks?",
+        "type": "citation"
+    },
+    {
+        "query": "How to handle a 12-year-old dog needing dental cleaning?",
+        "type": "multi-hop"
+    }
+]
