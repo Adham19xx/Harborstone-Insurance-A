@@ -116,6 +116,18 @@ Conversation:
     ) -> None:
         """
         Handles conflict detection and storing facts in SemanticStore.
+
+        FIXES applied vs. the original version:
+          1. `flag_conflict` used to be called with the SAME fact_id for both
+             fact_id_1 and fact_id_2 (the new fact didn't exist yet at that
+             point), which meant no real conflict link was ever recorded.
+             We now create the new fact FIRST, look up its real fact_id, and
+             only then flag the conflict between the OLD fact and the NEW
+             fact.
+          2. If the freshly extracted value is identical to the existing
+             active value, we skip storing a redundant duplicate version
+             (the original code always called add_or_update_fact, even when
+             nothing had actually changed).
         """
 
         if not entity or not attribute:
@@ -129,27 +141,19 @@ Conversation:
             None
         )
 
-        if existing_fact:
-            old_value = existing_fact.get("value")
+        # FIX 2: nothing actually changed -> don't create a redundant version
+        if existing_fact and existing_fact.get("value") == value:
+            logger.info(
+                f"No change for {entity}.{attribute} (value already '{value}'). "
+                "Skipping re-store."
+            )
+            return
 
-            if old_value != value:
-                logger.info(
-                    f"Conflict detected for {entity}.{attribute}: "
-                    f"'{old_value}' -> '{value}'"
-                )
+        old_fact_id = existing_fact.get("fact_id") if existing_fact else None
+        old_value = existing_fact.get("value") if existing_fact else None
 
-                # Explicit conflict handling as required by task specifications
-                resolution_note = (
-                    f"Conflict detected: attribute '{attribute}' value changed from "
-                    f"'{old_value}' to '{value}' via episode {source_episode_id}"
-                )
-                self.semantic_store.flag_conflict(
-                    fact_id_1=existing_fact["fact_id"],
-                    fact_id_2=existing_fact["fact_id"],
-                    resolution_note=resolution_note
-                )
-
-        # Store new version (semantic store handles versioning)
+        # Store the new version first (SemanticStore handles superseding +
+        # versioning of the previous active fact internally).
         self.semantic_store.add_or_update_fact(
             entity=entity,
             attribute=attribute,
@@ -157,3 +161,34 @@ Conversation:
             source_episode_id=source_episode_id,
             expires_at=expires_at
         )
+
+        if existing_fact:
+            logger.info(
+                f"Conflict detected for {entity}.{attribute}: "
+                f"'{old_value}' -> '{value}'"
+            )
+
+            # FIX 1: look up the fact we just created so we can pass its
+            # real fact_id, instead of reusing the old fact's id twice.
+            updated_facts = self.semantic_store.get_facts_by_entity(entity)
+            new_fact = max(
+                (f for f in updated_facts if f.get("attribute") == attribute),
+                key=lambda f: f.get("version", 0),
+                default=None
+            )
+
+            if new_fact and old_fact_id:
+                resolution_note = (
+                    f"Conflict detected: attribute '{attribute}' value changed from "
+                    f"'{old_value}' to '{value}' via episode {source_episode_id}"
+                )
+                self.semantic_store.flag_conflict(
+                    fact_id_1=old_fact_id,
+                    fact_id_2=new_fact["fact_id"],
+                    resolution_note=resolution_note
+                )
+            else:
+                logger.warning(
+                    f"Could not resolve both fact IDs for {entity}.{attribute}; "
+                    "skipping conflict flag."
+                )
