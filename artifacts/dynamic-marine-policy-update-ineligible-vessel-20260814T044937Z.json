@@ -1,0 +1,21 @@
+{
+  "method": "dynamic",
+  "request_id": "marine-policy-update-ineligible-vessel",
+  "goal": "I am a Harborstone Insurance customer and recently purchased a new vessel. Please review my existing marine policy, check whether the new vessel can be added, determine coverage impact, estimate the premium change, identify required information, and give me the final next steps.",
+  "started_at": "2026-08-14T04:49:36.324612+00:00",
+  "finished_at": "2026-08-14T04:49:37.552167+00:00",
+  "success": false,
+  "llm_calls": 1,
+  "input_tokens": 0,
+  "output_tokens": 0,
+  "total_tokens": 0,
+  "token_usage_available": false,
+  "mcp_calls": 1,
+  "latency_ms": 1227.55,
+  "plan": null,
+  "execution": [],
+  "observations": [],
+  "plan_changes": [],
+  "result": null,
+  "error": "MCP tool check_vessel_eligibility returned an error: 2 validation errors for call[check_vessel_eligibility]\nvessel_type\n  Missing required argument [type=missing_argument, input_value={'customer_id': 1, 'year_...2000, 'value': 500000.0}, input_type=dict]\n    For further information visit https://errors.pydantic.dev/2.13/v/missing_argument\ncustomer_id\n  Unexpected keyword argument [type=unexpected_keyword_argument, input_value=1, input_type=int]\n    For further information visit https://errors.pydantic.dev/2.13/v/unexpected_keyword_argument"
+}

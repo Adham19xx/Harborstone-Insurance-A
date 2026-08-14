@@ -1,0 +1,25 @@
+{
+  "request_id": "marine-policy-update-ineligible-vessel",
+  "same_request_type": true,
+  "methods": {
+    "decomposition_first": {
+      "success": false,
+      "mcp_calls": 1,
+      "llm_calls": 1,
+      "total_tokens": 0,
+      "latency_ms": 2662.83,
+      "trace": "C:\\Users\\adham\\Desktop\\Harborstone-Insurance-A\\artifacts\\decomposition_first-marine-policy-update-ineligible-vessel-20260814T044933Z.json",
+      "plan_changes": []
+    },
+    "dynamic": {
+      "success": false,
+      "mcp_calls": 1,
+      "llm_calls": 1,
+      "total_tokens": 0,
+      "latency_ms": 1227.55,
+      "trace": "C:\\Users\\adham\\Desktop\\Harborstone-Insurance-A\\artifacts\\dynamic-marine-policy-update-ineligible-vessel-20260814T044937Z.json",
+      "plan_changes": []
+    }
+  },
+  "dynamic_diverged": false
+}

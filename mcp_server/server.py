@@ -108,6 +108,119 @@ async def audit_high_risk_policies(ctx: Context) -> str:
 
 
 # ==========================================
+# 7. Planning integration tools (read-only underwriting lookups)
+# ==========================================
+@mcp.tool()
+def get_customer_policies(customer_id: int) -> str:
+    """Return the customer's active/recent marine policies from the real DB."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            """SELECT policy_id, customer_id, vessel_id, policy_type, start_date,
+                      end_date, premium, status
+               FROM Policies WHERE customer_id = %s
+               ORDER BY policy_id""",
+            (customer_id,),
+        )
+        return json.dumps(cursor.fetchall(), default=str)
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def get_vessel(vessel_id: int) -> str:
+    """Return one vessel record from the real Harborstone DB."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM Vessels WHERE vessel_id = %s", (vessel_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise ValueError(f"Vessel {vessel_id} was not found")
+        return json.dumps(row, default=str)
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def check_vessel_eligibility(
+    vessel_type: str,
+    year_built: int,
+    value: float,
+) -> str:
+    """Apply Harborstone's fictional demo underwriting rules to a new vessel.
+
+    Rules used only for this lab's reproducible evaluation:
+    - vessel age must be <= 20 years;
+    - declared value must be > 0;
+    - supported types are Boat and Yacht.
+    """
+    from datetime import date
+
+    current_year = date.today().year
+    age = current_year - year_built
+    reasons: list[str] = []
+    if vessel_type not in {"Boat", "Yacht"}:
+        reasons.append("Unsupported vessel type")
+    if value <= 0:
+        reasons.append("Declared value must be positive")
+    if age > 20:
+        reasons.append("Vessel is older than the 20-year underwriting limit")
+    eligible = not reasons
+    return json.dumps(
+        {
+            "eligible": eligible,
+            "vessel_age": age,
+            "reasons": reasons,
+            "checked_rules": [
+                "age <= 20 years",
+                "type in {Boat, Yacht}",
+                "value > 0",
+            ],
+        }
+    )
+
+
+@mcp.tool()
+def estimate_policy_premium_change(
+    current_premium: float,
+    vessel_type: str,
+    vessel_value: float,
+) -> str:
+    """Estimate the incremental annual premium using lab underwriting rates."""
+    rates = {"Boat": 0.01, "Yacht": 0.015}
+    if vessel_type not in rates:
+        raise ValueError("Unsupported vessel type")
+    if current_premium < 0 or vessel_value <= 0:
+        raise ValueError("Premium and vessel value must be valid positive values")
+    additional = round(vessel_value * rates[vessel_type], 2)
+    return json.dumps(
+        {
+            "current_premium": round(current_premium, 2),
+            "estimated_additional_premium": additional,
+            "estimated_new_premium": round(current_premium + additional, 2),
+            "rate_used": rates[vessel_type],
+            "note": "Estimate for the Week 4 lab; final underwriting approval is required.",
+        }
+    )
+
+
+@mcp.tool()
+def get_policy_update_requirements(
+    vessel_type: str,
+    vessel_value: float,
+) -> str:
+    """Return deterministic documentation requirements for a policy update."""
+    documents = ["Proof of ownership/purchase invoice", "Current vessel registration"]
+    if vessel_type == "Yacht":
+        documents.append("Current vessel valuation")
+    if vessel_value >= 500000:
+        documents.append("Recent independent valuation report")
+    return json.dumps({"required_documents": documents})
+
+
+# ==========================================
 # 7. الأمان والتأكيد البشري (Defensive Logic & Elicitation)
 # ==========================================
 @mcp.tool()
