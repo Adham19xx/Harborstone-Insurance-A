@@ -1,226 +1,279 @@
-"""Reflexion Multi-Trial Reinforcement Planning for Harborstone Insurance.
+"""
+reflexion.py — Reflexion with Episodic Memory for Harborstone Insurance
+=====================================================================
+Adapted from AmrSheta22/task_decomposition_and_planning (planning_lab/algorithms/reflexion.py).
 
-Based on Shinn et al. (2023): 'Reflexion: Language Agents with Verbal Reinforcement Learning'.
+Key differences from the toolkit:
+  1. The Environment used here is the REAL grounded HarborstoneMCPEnvironment,
+     not the randomized fake one.
+  2. The episodic memory buffer is explicitly typed and persisted across trials
+     within the same run (capped at `memory_size` most-recent reflections).
+  3. The evaluate step checks the output against real Harborstone business rules
+     (vessel schema, premium positivity, document list completeness).
 
-Reflexion addresses hard multi-step problems where a single shot or single retry
-is insufficient. It executes multiple trials, evaluating each attempt with
-the Grounded Environment, generating verbal self-reflections upon failure,
-and carrying an episodic memory buffer of past reflections into subsequent trials.
+Used for sub-tasks where a single retry isn't enough and the agent needs
+to LEARN across attempts within the same run:
+  "Generate the full policy update proposal for customer X including
+   eligibility, premium impact, and required documents."
+
+This sub-task frequently fails on the first attempt because:
+  - The LLM hallucinates vessel types not in the Harborstone schema
+  - Premium estimates are missing numeric values
+  - Required documents are omitted from the draft
+Only Reflexion's cross-trial memory reliably fixes all three across runs.
 """
 
 from __future__ import annotations
 
-import json
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
-from pydantic import BaseModel, ConfigDict, Field
+import time
+from dataclasses import dataclass, field
 
-from ..environment import GroundedEnvironment, EnvironmentFeedback
-from ..integration.trace import RunTrace
+from langchain_core.language_models.chat_models import BaseChatModel
 
-if TYPE_CHECKING:
-    from langchain_core.language_models.chat_models import BaseChatModel
+from .environment import Environment, EnvironmentFeedback
 
 
-class TrialRecord(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    trial_number: int
-    proposed_action: Dict[str, Any]
+# ---------------------------------------------------------------------------
+# Data classes — compatible with toolkit's ReflexionTrial / ReflexionResult
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ReflexionTrial:
+    """A single Reflexion trial."""
+    number: int
+    attempt: str
     feedback: EnvironmentFeedback
-    verbal_reflection: Optional[str] = None
+    reflection: str | None = None       # verbal reflection (if trial failed)
 
 
-class ReflexionMemory(BaseModel):
-    """Capped episodic memory buffer for verbal reflections."""
-    model_config = ConfigDict(extra="forbid")
-    max_reflections: int = 5
-    reflections: List[str] = Field(default_factory=list)
+@dataclass
+class EpisodicMemoryBuffer:
+    """
+    Capped episodic memory for Reflexion.
 
-    def add_reflection(self, reflection: str) -> None:
-        self.reflections.append(reflection)
-        if len(self.reflections) > self.max_reflections:
-            self.reflections.pop(0)  # Maintain capped buffer size
+    Stores verbal reflections from failed trials so that each new trial
+    can read from past mistakes.  max_size enforces the cap.
+    """
+    max_size: int = 3
+    _entries: list[str] = field(default_factory=list)
+
+    def add(self, reflection: str) -> None:
+        self._entries.append(reflection)
+        if len(self._entries) > self.max_size:
+            self._entries = self._entries[-self.max_size:]
+
+    def recall(self) -> list[str]:
+        """Return the most-recent reflections (up to max_size)."""
+        return list(self._entries)
+
+    def as_context_block(self) -> str:
+        """Format for inclusion in a prompt."""
+        if not self._entries:
+            return "- No prior trials."
+        return "\n".join(f"- {entry}" for entry in self._entries)
 
 
-class ReflexionResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    task_goal: str
-    trials_attempted: int
+@dataclass
+class ReflexionResult:
     success: bool
-    final_score: float
-    final_solution: Dict[str, Any]
-    episodic_memory: List[str]
-    trials: List[TrialRecord]
+    output: str
+    trials: list[ReflexionTrial]
+    memory: list[str]                   # contents of the episodic buffer at end
+    llm_calls: int = 0
+    tokens_used: int = 0
+    latency_s: float = 0.0
 
 
-def run_reflexion(
-    task_goal: str,
-    initial_request: Dict[str, Any],
-    environment: Optional[GroundedEnvironment] = None,
-    max_trials: int = 4,
-    llm: Optional[BaseChatModel] = None,
-    trace: Optional[RunTrace] = None,
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
+_ATTEMPT_SYSTEM = """\
+You are a Harborstone Insurance policy advisor.
+Your task is to produce a complete, accurate response to the given insurance request.
+If you have prior trial reflections (episodic memory), learn from them.
+
+Harborstone business rules you must follow:
+  - vessel_type must be: cargo, tanker, passenger, fishing, or yacht
+  - All premium values must be positive floats in USD
+  - A policy update always requires: eligibility confirmation, premium impact estimate,
+    and a list of required documents
+  - Do not invent data — describe what the MCP tools would return
+"""
+
+_EVALUATE_SYSTEM = """\
+You are a Harborstone Insurance critic evaluating a trial attempt.
+The attempt should:
+  1. Confirm vessel eligibility with a clear YES/NO
+  2. State the estimated premium change (with a numeric value in USD)
+  3. List required documents for the policy update
+  4. Respect Harborstone vessel_type constraints
+Respond with:
+VERDICT: PASS or FAIL
+ISSUES: <bullet list of specific problems if FAIL, or "None" if PASS>
+"""
+
+_REFLECT_SYSTEM = """\
+You are a Harborstone Insurance self-improvement agent.
+The previous attempt failed. Write a verbal reflection (2-3 sentences) that:
+  1. Names the specific Harborstone rule or rubric point that was violated
+  2. Explains concretely what to do differently in the next attempt
+  3. References the actual failure (e.g., "missing USD premium value", "invalid vessel type")
+Be specific — vague reflections like "do better" earn no credit.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Core Reflexion function — interface matches toolkit's reflexion()
+# ---------------------------------------------------------------------------
+
+def reflexion(
+    task: str,
+    llm: BaseChatModel,
+    environment: Environment,
+    *,
+    max_trials: int = 3,
+    memory_size: int = 3,
+    task_id: str = "unknown",
+    context: str = "",
 ) -> ReflexionResult:
     """
-    Execute Reflexion multi-trial loop with grounded environment feedback and verbal memory.
+    Reflexion with capped episodic memory for Harborstone policy update tasks.
+
+    Each trial:
+      1. Recalls the episodic buffer (verbal reflections from prior failures)
+      2. Produces an attempt informed by those reflections
+      3. Evaluates the attempt with the GROUNDED environment
+      4. If failed, generates a verbal reflection and adds it to the episodic buffer
+      5. Repeats until success or max_trials exhausted
+
+    Parameters
+    ----------
+    task : str
+        The sub-task instruction.
+    llm : BaseChatModel
+        LangChain-compatible chat model.
+    environment : Environment
+        The REAL grounded Harborstone environment (not the toolkit's random default).
+    max_trials : int
+        Maximum number of retry attempts (default 3).
+    memory_size : int
+        Episodic buffer capacity (default 3 = capped).
+    task_id : str
+        DAG node id for tracing.
+    context : str
+        Upstream MCP tool results as formatted text.
+
+    Returns
+    -------
+    ReflexionResult
     """
-    env = environment if environment is not None else GroundedEnvironment()
-    memory = ReflexionMemory(max_reflections=5)
-    trials: List[TrialRecord] = []
+    if max_trials < 1 or memory_size < 1:
+        raise ValueError("max_trials and memory_size must be positive integers")
 
-    current_context = dict(initial_request)
-    success = False
-    final_score = 0.0
-    final_solution = {}
+    t0 = time.perf_counter()
+    memory = EpisodicMemoryBuffer(max_size=memory_size)
+    trials: list[ReflexionTrial] = []
+    best_attempt = ""
+    best_score = -1.0
+    llm_calls = 0
+    tokens = 0
 
-    for trial_idx in range(1, max_trials + 1):
-        # 1. Action Generation (conditioned on prior episodic reflections)
-        if llm is not None:
-            action = _generate_action_with_llm(task_goal, current_context, memory, llm, trace)
-        else:
-            action = _generate_action_deterministic(current_context, memory.reflections, trial_idx)
+    def _add_tokens(resp) -> None:
+        nonlocal tokens
+        if hasattr(resp, "usage_metadata") and resp.usage_metadata:
+            tokens += resp.usage_metadata.get("total_tokens", 0)
+        elif hasattr(resp, "response_metadata"):
+            meta = resp.response_metadata or {}
+            usage = meta.get("usage", {})
+            tokens += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
 
-        # 2. Grounded Environment Evaluation
-        feedback = env.evaluate_proposal(action)
+    context_block = f"\n\nContext (upstream MCP results):\n{context}" if context else ""
 
-        # 3. Reflection Generation on Failure
-        reflection: Optional[str] = None
-        if not feedback.success:
-            reflection = (
-                f"[Trial #{trial_idx} Failed]: Underwriting violations encountered: {'; '.join(feedback.violations)}. "
-                f"For the next attempt, explicitly fix: {', '.join(feedback.violations)}."
-            )
-            memory.add_reflection(reflection)
-        else:
-            success = True
-            final_score = feedback.score
-            final_solution = action
+    for trial_num in range(1, max_trials + 1):
+        # --- Step 1: Recall episodic memory ---
+        recalled = memory.as_context_block()
 
-        record = TrialRecord(
-            trial_number=trial_idx,
-            proposed_action=action,
+        # --- Step 2: Attempt ---
+        attempt_resp = llm.invoke([
+            ("system", _ATTEMPT_SYSTEM),
+            ("human", (
+                f"Task:\n{task}{context_block}\n\n"
+                f"Episodic memory from prior trials:\n{recalled}\n\n"
+                "Produce your best response now."
+            )),
+        ])
+        llm_calls += 1
+        _add_tokens(attempt_resp)
+        attempt_text = attempt_resp.content if hasattr(attempt_resp, "content") else str(attempt_resp)
+
+        # Track best regardless of outcome
+        if attempt_text and len(attempt_text) > len(best_attempt):
+            best_attempt = attempt_text
+
+        # --- Step 3: Grounded evaluation ---
+        feedback = environment.evaluate(task=task, output=attempt_text)
+
+        # --- Step 4 (optional): LLM also evaluates for nuanced critique ---
+        eval_resp = llm.invoke([
+            ("system", _EVALUATE_SYSTEM),
+            ("human", (
+                f"Task:\n{task}\n\n"
+                f"Attempt:\n{attempt_text}\n\n"
+                f"Grounded environment feedback:\n"
+                f"Score: {feedback.score:.2f} | {feedback.message}"
+            )),
+        ])
+        llm_calls += 1
+        _add_tokens(eval_resp)
+
+        if feedback.score > best_score:
+            best_score = feedback.score
+            best_attempt = attempt_text
+
+        trial = ReflexionTrial(
+            number=trial_num,
+            attempt=attempt_text,
             feedback=feedback,
-            verbal_reflection=reflection,
         )
-        trials.append(record)
 
-        if success:
+        # --- Step 5: Reflect on failure and update episodic memory ---
+        if not feedback.success:
+            reflect_resp = llm.invoke([
+                ("system", _REFLECT_SYSTEM),
+                ("human", (
+                    f"Task:\n{task}\n\n"
+                    f"Failed attempt (Trial {trial_num}):\n{attempt_text}\n\n"
+                    f"Environment issues:\n"
+                    + "\n".join(f"- {i}" for i in feedback.caught_issues)
+                    + f"\n\nEnvironment score: {feedback.score:.2f}"
+                )),
+            ])
+            llm_calls += 1
+            _add_tokens(reflect_resp)
+            reflection_text = reflect_resp.content if hasattr(reflect_resp, "content") else str(reflect_resp)
+            trial.reflection = reflection_text
+            # Add to episodic buffer (capped)
+            memory.add(reflection_text)
+        else:
+            # Success — no reflection needed
+            trials.append(trial)
             break
 
-    if not success and trials:
-        final_score = trials[-1].feedback.score
-        final_solution = trials[-1].proposed_action
+        trials.append(trial)
 
-    res = ReflexionResult(
-        task_goal=task_goal,
-        trials_attempted=len(trials),
-        success=success,
-        final_score=final_score,
-        final_solution=final_solution,
-        episodic_memory=memory.reflections,
+    latency = time.perf_counter() - t0
+    return ReflexionResult(
+        success=best_score >= environment.success_threshold,
+        output=best_attempt,
         trials=trials,
+        memory=memory.recall(),
+        llm_calls=llm_calls,
+        tokens_used=tokens,
+        latency_s=round(latency, 3),
     )
 
-    if trace is not None:
-        trace.execution.append({
-            "method": "Reflexion",
-            "trials": len(trials),
-            "success": success,
-            "reflections_count": len(memory.reflections),
-        })
 
-    return res
+# Alias
+run_reflexion = reflexion
 
-
-def _generate_action_with_llm(
-    goal: str,
-    context: Dict[str, Any],
-    memory: ReflexionMemory,
-    llm: BaseChatModel,
-    trace: Optional[RunTrace],
-) -> Dict[str, Any]:
-    prompt = f"""Goal: {goal}
-Context: {json.dumps(context, default=str)}
-
-Episodic Memory of Prior Reflections from Failed Attempts:
-{chr(10).join(f"- {r}" for r in memory.reflections) if memory.reflections else "None (First Trial)"}
-
-Propose a valid policy endorsement structure that avoids all past mistakes."""
-
-    class ActionProposal(BaseModel):
-        vessel_type: str
-        year_built: int
-        vessel_value: float
-        current_premium: float
-        proposed_premium: float
-        deductible: float
-        documents: List[str]
-
-    try:
-        res = llm.with_structured_output(ActionProposal, method="json_schema").invoke([("human", prompt)])
-        if trace is not None:
-            trace.add_llm_usage(res)
-        return res.model_dump()
-    except Exception:
-        return _generate_action_deterministic(context, memory.reflections, len(memory.reflections) + 1)
-
-
-def _generate_action_deterministic(
-    context: Dict[str, Any], reflections: List[str], trial_idx: int
-) -> Dict[str, Any]:
-    """
-    Demonstrates realistic progression where the agent learns from grounded reflections:
-    - Trial 1: naive proposal (e.g. wrong deductible or missing required survey for >$500k yacht).
-    - Trial 2+: incorporates reflection to add survey and fix deductible/rate.
-    """
-    vessel_type = context.get("vessel_type", context.get("new_vessel", {}).get("vessel_type", "Yacht"))
-    vessel_value = float(context.get("vessel_value", context.get("new_vessel", {}).get("value", 600000.0)))
-    year_built = int(context.get("year_built", context.get("new_vessel", {}).get("year_built", 2024)))
-    current_premium = float(context.get("current_premium", 1500.0))
-
-    rate = 0.015 if vessel_type == "Yacht" else 0.010
-    correct_premium = round(current_premium + (vessel_value * rate), 2)
-
-    has_survey_reflection = any("survey" in r.lower() or "appraisal" in r.lower() or "500,000" in r for r in reflections)
-    has_deductible_reflection = any("deductible" in r.lower() for r in reflections)
-
-    # Initial naive proposal (omits survey and has low deductible)
-    if trial_idx == 1 and not reflections:
-        return {
-            "strategy": "Initial Naive Proposal",
-            "vessel_type": vessel_type,
-            "year_built": year_built,
-            "vessel_value": vessel_value,
-            "current_premium": current_premium,
-            "proposed_premium": correct_premium,
-            "deductible": 200.0,  # Below minimum
-            "documents": ["Proof of purchase"],  # Missing survey
-        }
-
-    # Second trial fixing deductible if flagged
-    if trial_idx == 2 and not has_survey_reflection:
-        return {
-            "strategy": "Adjusted Deductible Proposal",
-            "vessel_type": vessel_type,
-            "year_built": year_built,
-            "vessel_value": vessel_value,
-            "current_premium": current_premium,
-            "proposed_premium": correct_premium,
-            "deductible": 5000.0,  # Compliant deductible
-            "documents": ["Proof of purchase", "Registration"],  # Still missing survey
-        }
-
-    # Final trial fully incorporating episodic verbal reflections
-    return {
-        "strategy": "Fully Grounded Reflexion Solution",
-        "vessel_type": vessel_type,
-        "year_built": year_built,
-        "vessel_value": vessel_value,
-        "current_premium": current_premium,
-        "proposed_premium": correct_premium,
-        "deductible": round(vessel_value * 0.05, 2),
-        "documents": [
-            "Proof of purchase",
-            "Current vessel registration",
-            "Recent independent marine surveyor appraisal report",
-        ],
-    }

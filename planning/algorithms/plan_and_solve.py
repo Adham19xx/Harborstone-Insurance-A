@@ -1,255 +1,173 @@
-"""Plan-and-Solve (PS) Prompting Algorithm for Harborstone Insurance.
+"""
+plan_and_solve.py — Plan-and-Solve for Harborstone Insurance
+=====================================================================
+Adapted from the reference toolkit (AmrSheta22/task_decomposition_and_planning).
+Keeps the original two-phase interface (PLAN then SOLVE) but wraps it
+around a real Harborstone sub-task whose "solution" is a concrete MCP
+tool call plus a natural-language explanation.
 
-Based on Wang et al. (ACL 2023): 'Plan-and-Solve Prompting: Improving Zero-Shot
-Chain-of-Thought Reasoning by Large Language Models'.
+Person 2 owns this file.  Person 1's decomposition.py calls plan_and_solve()
+for any DAG node whose `kind == "mcp"` and whose tool is deterministic
+(no ambiguity in arguments).
 
-PS breaks down a complex sub-task into an explicit sequential plan (Phase 1),
-then solves each step in a single pass without branching (Phase 2).
-It is ideal for deterministic, mathematical, or formula-heavy sub-tasks
-such as actuarial premium calculations, deductible discounting, and fee scheduling.
+Route selection (see router.py):
+  PS  → deterministic MCP lookups (get_customer_policies, get_vessel …)
+  ToT → synthesis nodes that require comparing alternatives
+  LATS→ high-stakes nodes (eligibility + premium estimation together)
 """
 
 from __future__ import annotations
 
-import json
 import time
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
-from pydantic import BaseModel, ConfigDict, Field
+import json
+from dataclasses import dataclass, field
+from typing import Any
 
-from ..integration.trace import RunTrace
+from langchain_core.language_models.chat_models import BaseChatModel
 
-if TYPE_CHECKING:
-    from langchain_core.language_models.chat_models import BaseChatModel
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
 
-
-class PlanStep(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    step_number: int
-    description: str
-    variable_to_compute: str
-    formula_or_rule: str
-
-
-class PlanAndSolvePlan(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    goal: str
-    steps: List[PlanStep] = Field(min_length=1)
-
-
-class StepSolution(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    step_number: int
-    variable_name: str
-    value: Any
-    explanation: str
-
-
-class PlanAndSolveResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    goal: str
-    plan: List[PlanStep]
-    step_solutions: List[StepSolution]
-    final_output: Dict[str, Any]
+@dataclass
+class PlanAndSolveResult:
+    """Structured result from a Plan-and-Solve run."""
+    task_id: str
+    tool_name: str | None
+    plan: str                      # the PLAN phase text
+    solution: str                  # the SOLVE phase text (final answer)
+    llm_calls: int = 2             # always 2: one plan, one solve
+    tokens_used: int = 0
+    latency_s: float = 0.0
     success: bool = True
 
 
-PLAN_SYSTEM_PROMPT = """You are the Harborstone Insurance Actuarial Plan-and-Solve Assistant.
-Given a complex insurance computation or deterministic policy adjustment request:
-1. Break it down into clear, sequential calculation steps.
-2. For each step, identify what variable is computed and the exact formula or rule.
-3. Keep the plan linear with no branching.
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
+_PLAN_SYSTEM = """\
+You are a Harborstone Insurance planning assistant.
+You will receive a single sub-task that is part of a larger insurance policy-update request.
+Your job is to produce a clear, numbered PLAN for how to solve that sub-task.
+Do NOT execute the plan yet — only describe the steps.
+Be concise: 2-4 steps maximum.
 """
 
-SOLVE_SYSTEM_PROMPT = """You are the Harborstone Insurance Computation Engine.
-Execute the planned calculation steps in sequence. Use the results of previous steps to compute subsequent values.
-Ensure all arithmetic is precise and compliant with Harborstone rates:
-- Boat annual rate: 1.0% of vessel value
-- Yacht annual rate: 1.5% of vessel value
-- Deductible discount: 5% discount on additional premium if deductible >= 5% of vessel value
-- Surcharge: 10% on vessel age > 10 years (if eligible)
+_SOLVE_SYSTEM = """\
+You are a Harborstone Insurance execution assistant.
+You will receive a sub-task and its PLAN.
+Execute the plan step-by-step and produce the final answer.
+If the sub-task requires calling an MCP tool, specify:
+  TOOL: <tool_name>
+  ARGUMENTS: <json dict>
+  RESULT INTERPRETATION: <what the result means for the customer>
+Always end with a CONCLUSION section.
 """
 
+
+# ---------------------------------------------------------------------------
+# Core function — kept interface-compatible with the toolkit's plan_and_solve
+# ---------------------------------------------------------------------------
 
 def plan_and_solve(
-    task_goal: str,
-    context: Dict[str, Any],
-    llm: Optional[BaseChatModel] = None,
-    trace: Optional[RunTrace] = None,
+    question: str,
+    llm: BaseChatModel,
+    *,
+    task_id: str = "unknown",
+    tool_name: str | None = None,
+    arguments: dict[str, Any] | None = None,
+    context: dict[str, Any] | None = None,
 ) -> PlanAndSolveResult:
     """
-    Execute the Plan-and-Solve algorithm on a deterministic sub-task.
+    Two-phase Plan-and-Solve for a single Harborstone sub-task.
+
+    Phase 1 — PLAN : ask the LLM to devise a numbered plan.
+    Phase 2 — SOLVE: ask the LLM to execute the plan step by step.
+
+    This matches the original toolkit's interface (plan_and_solve(question, llm))
+    and adds Harborstone-specific context (tool signatures, customer data).
+
+    Parameters
+    ----------
+    question : str
+        The sub-task instruction (e.g. "Check vessel eligibility for …").
+    llm : BaseChatModel
+        Any LangChain-compatible chat model (Anthropic Claude, OpenAI, Gemini …).
+    task_id : str
+        The DAG node id, used for tracing.
+    tool_name : str | None
+        The Harborstone MCP tool this node should call (if kind == "mcp").
+    arguments : dict | None
+        Pre-filled arguments from the decomposition DAG.
+    context : dict | None
+        Outputs from upstream DAG nodes (dependency results).
+
+    Returns
+    -------
+    PlanAndSolveResult
     """
-    start_time = time.perf_counter()
+    t0 = time.perf_counter()
+    context = context or {}
+    arguments = arguments or {}
 
-    if llm is not None:
-        try:
-            # Phase 1: Planning Phase
-            plan_response = llm.with_structured_output(
-                PlanAndSolvePlan,
-                method="json_schema",
-            ).invoke(
-                [
-                    ("system", PLAN_SYSTEM_PROMPT),
-                    (
-                        "human",
-                        f"Devise a linear calculation plan for this task:\nGoal: {task_goal}\n"
-                        f"Context Data: {json.dumps(context, default=str)}",
-                    ),
-                ]
-            )
-            if trace is not None:
-                trace.add_llm_usage(plan_response)
+    # Build a rich human prompt that includes tool signature + upstream context
+    context_block = ""
+    if context:
+        context_block = "\n\nContext from upstream tasks:\n" + json.dumps(context, indent=2, default=str)
 
-            steps = plan_response.steps
+    tool_block = ""
+    if tool_name:
+        tool_block = f"\n\nYou must call MCP tool: {tool_name}\nArguments available: {json.dumps(arguments, indent=2)}"
 
-            # Phase 2: Sequential Solving Phase
-            accumulated_state: Dict[str, Any] = dict(context)
-            solutions: List[StepSolution] = []
+    human_prompt = f"""{question}{tool_block}{context_block}
 
-            for step in steps:
-                solve_prompt = f"""Task Goal: {task_goal}
-Current Step: #{step.step_number} - {step.description}
-Rule: {step.formula_or_rule}
-Variable to compute: {step.variable_to_compute}
-Accumulated context/variables so far:
-{json.dumps(accumulated_state, default=str)}
+First understand the problem and devise a plan to solve it. Then carry out the
+plan step by step. Check that each step is consistent with the available tool
+signatures and the Harborstone Insurance business rules:
+- Vessel value must be > 0
+- vessel_type must be one of: cargo, tanker, passenger, fishing, yacht
+- Premiums are always positive floats in USD
+- Policy updates require eligibility check BEFORE premium estimation
+"""
 
-Compute the value for '{step.variable_to_compute}' and return the step solution."""
+    # -----------------------------------------------------------------------
+    # Phase 1: PLAN
+    # -----------------------------------------------------------------------
+    plan_response = llm.invoke([
+        ("system", _PLAN_SYSTEM),
+        ("human", human_prompt),
+    ])
+    plan_text: str = plan_response.content if hasattr(plan_response, "content") else str(plan_response)
 
-                step_res = llm.with_structured_output(
-                    StepSolution,
-                    method="json_schema",
-                ).invoke(
-                    [
-                        ("system", SOLVE_SYSTEM_PROMPT),
-                        ("human", solve_prompt),
-                    ]
-                )
-                if trace is not None:
-                    trace.add_llm_usage(step_res)
+    # -----------------------------------------------------------------------
+    # Phase 2: SOLVE
+    # -----------------------------------------------------------------------
+    solve_response = llm.invoke([
+        ("system", _SOLVE_SYSTEM),
+        ("human", f"Sub-task: {question}\n\nPLAN:\n{plan_text}\n\nNow execute the plan step by step."),
+    ])
+    solution_text: str = solve_response.content if hasattr(solve_response, "content") else str(solve_response)
 
-                solutions.append(step_res)
-                accumulated_state[step_res.variable_name] = step_res.value
+    latency = time.perf_counter() - t0
 
-            final_output = {sol.variable_name: sol.value for sol in solutions}
-            final_output["status"] = "calculated"
-
-            return PlanAndSolveResult(
-                goal=task_goal,
-                plan=steps,
-                step_solutions=solutions,
-                final_output=final_output,
-                success=True,
-            )
-
-        except Exception as exc:
-            # Fall back to deterministic calculation engine if LLM structured output fails
-            if trace is not None:
-                trace.plan_changes.append({"event": "ps_fallback", "error": str(exc)})
-
-    # Deterministic Engine Implementation (Zero-hallucination fallback / test mode)
-    return _deterministic_plan_and_solve(task_goal, context)
-
-
-def _deterministic_plan_and_solve(
-    task_goal: str, context: Dict[str, Any]
-) -> PlanAndSolveResult:
-    """Deterministic reference implementation of Plan-and-Solve for Harborstone math."""
-    vessel_value = float(context.get("vessel_value", context.get("value", 100000.0)))
-    vessel_type = context.get("vessel_type", "Boat")
-    current_premium = float(context.get("current_premium", 1200.0))
-    year_built = int(context.get("year_built", 2020))
-    current_year = int(context.get("current_year", 2026))
-    age = current_year - year_built
-    deductible = float(context.get("deductible", 2500.0))
-
-    # Phase 1: Explicit Plan
-    steps = [
-        PlanStep(
-            step_number=1,
-            description="Determine base rate based on vessel type",
-            variable_to_compute="base_rate",
-            formula_or_rule="0.010 for Boat, 0.015 for Yacht",
-        ),
-        PlanStep(
-            step_number=2,
-            description="Calculate base additional annual premium",
-            variable_to_compute="base_additional_premium",
-            formula_or_rule="vessel_value * base_rate",
-        ),
-        PlanStep(
-            step_number=3,
-            description="Check age surcharge",
-            variable_to_compute="age_surcharge",
-            formula_or_rule="10% of base_additional if age > 10 else 0.0",
-        ),
-        PlanStep(
-            step_number=4,
-            description="Calculate deductible adjustment discount",
-            variable_to_compute="deductible_discount",
-            formula_or_rule="5% discount on base additional if deductible >= 5% of value else 0.0",
-        ),
-        PlanStep(
-            step_number=5,
-            description="Calculate total new annual policy premium",
-            variable_to_compute="total_new_premium",
-            formula_or_rule="current_premium + base_additional_premium + age_surcharge - deductible_discount",
-        ),
-    ]
-
-    # Phase 2: Sequential Solve
-    rate = 0.015 if vessel_type == "Yacht" else 0.010
-    base_add = round(vessel_value * rate, 2)
-    surcharge = round(base_add * 0.10, 2) if age > 10 else 0.0
-    discount = round(base_add * 0.05, 2) if deductible >= (vessel_value * 0.05) else 0.0
-    total = round(current_premium + base_add + surcharge - discount, 2)
-
-    solutions = [
-        StepSolution(
-            step_number=1,
-            variable_name="base_rate",
-            value=rate,
-            explanation=f"Rate for {vessel_type} is {rate*100:.1f}%.",
-        ),
-        StepSolution(
-            step_number=2,
-            variable_name="base_additional_premium",
-            value=base_add,
-            explanation=f"${vessel_value:,.2f} * {rate} = ${base_add:,.2f}",
-        ),
-        StepSolution(
-            step_number=3,
-            variable_name="age_surcharge",
-            value=surcharge,
-            explanation=f"Vessel age is {age} years -> surcharge = ${surcharge:,.2f}",
-        ),
-        StepSolution(
-            step_number=4,
-            variable_name="deductible_discount",
-            value=discount,
-            explanation=f"Deductible ${deductible:,.2f} -> discount = ${discount:,.2f}",
-        ),
-        StepSolution(
-            step_number=5,
-            variable_name="total_new_premium",
-            value=total,
-            explanation=f"${current_premium:,.2f} + ${base_add:,.2f} + ${surcharge:,.2f} - ${discount:,.2f} = ${total:,.2f}",
-        ),
-    ]
-
-    final_output = {
-        "base_rate": rate,
-        "base_additional_premium": base_add,
-        "age_surcharge": surcharge,
-        "deductible_discount": discount,
-        "total_new_premium": total,
-        "status": "calculated",
-    }
+    # Rough token accounting (works for Anthropic & OpenAI response objects)
+    tokens = 0
+    for resp in (plan_response, solve_response):
+        if hasattr(resp, "usage_metadata") and resp.usage_metadata:
+            tokens += resp.usage_metadata.get("total_tokens", 0)
+        elif hasattr(resp, "response_metadata"):
+            meta = resp.response_metadata or {}
+            usage = meta.get("usage", {})
+            tokens += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
 
     return PlanAndSolveResult(
-        goal=task_goal,
-        plan=steps,
-        step_solutions=solutions,
-        final_output=final_output,
+        task_id=task_id,
+        tool_name=tool_name,
+        plan=plan_text,
+        solution=solution_text,
+        llm_calls=2,
+        tokens_used=tokens,
+        latency_s=round(latency, 3),
         success=True,
     )

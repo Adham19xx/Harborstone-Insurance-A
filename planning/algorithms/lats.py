@@ -1,275 +1,335 @@
-"""Language Agent Tree Search (LATS) Planning Algorithm for Harborstone Insurance.
+"""
+lats.py — Language Agent Tree Search (LATS) for Harborstone Insurance
+=====================================================================
+Adapted from AmrSheta22/task_decomposition_and_planning (planning_lab/algorithms/lats.py).
+Preserves the MCTS four-phase loop (select → expand+simulate → evaluate/reflect → backpropagate)
+but replaces the toolkit's randomized Environment with the real HarborstoneMCPEnvironment.
 
-Based on Zhou et al. (2023): 'Language Agent Tree Search Unifies Reasoning,
-Acting, and Planning in Language Models'.
+Router rule (see router.py):
+  LATS → high-stakes nodes: check_vessel_eligibility + estimate_policy_premium_change
+         together, where a wrong plan costs real money / customer trust.
 
-LATS implements a full Monte Carlo Tree Search (MCTS) loop over reasoning & tool action steps:
-1. Select: Traverse existing tree using Upper Confidence Bounds applied to Trees (UCT).
-2. Expand & Simulate: Sample candidate actions and roll out next state.
-3. Evaluate & Reflect: Score state against REAL EXTERNAL GROUNDED FEEDBACK (EnvironmentFeedback),
-   and synthesize a verbal reflection on failed branches to steer future exploration.
-4. Backpropagate: Update visit counts and value estimates up to root.
-
-Replaces fake randomized evaluator with real Harborstone underwriting & database rules.
+Key changes from the toolkit:
+  - environment.Environment is the REAL grounded evaluator (environment.py in this folder)
+  - Reflections carry Harborstone-specific failure reasons (schema issues, missing keys)
+  - The action generator is primed with Harborstone tool signatures
 """
 
 from __future__ import annotations
 
-import json
 import math
 import time
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import Any
+
+from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..environment import GroundedEnvironment, UngroundedEnvironment, EnvironmentFeedback
-from ..integration.trace import RunTrace
-
-if TYPE_CHECKING:
-    from langchain_core.language_models.chat_models import BaseChatModel
+from .environment import Environment, EnvironmentFeedback
 
 
+# ---------------------------------------------------------------------------
+# Pydantic helpers — compatible with toolkit's LATSAction / LATSActionBatch
+# ---------------------------------------------------------------------------
+
+class LATSAction(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    action: str = Field(min_length=2)
+    state: str = Field(min_length=2)
+
+
+class LATSActionBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    actions: list[LATSAction] = Field(min_length=1, max_length=3)
+
+
+class ValueEstimate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    score: float = Field(ge=0.0, le=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Tree node
+# ---------------------------------------------------------------------------
+
+@dataclass
 class LATSNode:
-    """A search tree node in the LATS MCTS hierarchy."""
-
-    def __init__(
-        self,
-        node_id: str,
-        state: Dict[str, Any],
-        parent: Optional["LATSNode"] = None,
-        action: Optional[Dict[str, Any]] = None,
-        depth: int = 0,
-    ):
-        self.node_id = node_id
-        self.state = state
-        self.parent = parent
-        self.action = action or {}
-        self.depth = depth
-        self.children: List["LATSNode"] = []
-        self.visits: int = 0
-        self.value_sum: float = 0.0
-        self.feedback: Optional[EnvironmentFeedback] = None
-        self.reflection: Optional[str] = None
-        self.is_terminal: bool = False
+    state: str
+    action: str = "root"
+    parent: "LATSNode | None" = field(default=None, repr=False)
+    children: list["LATSNode"] = field(default_factory=list, repr=False)
+    visits: int = 0
+    value_sum: float = 0.0
+    environment_score: float = 0.0
+    model_score: float = 0.0
+    feedback: EnvironmentFeedback | None = None
+    reflections: list[str] = field(default_factory=list)
 
     @property
-    def q_value(self) -> float:
-        return self.value_sum / self.visits if self.visits > 0 else 0.0
-
-    def uct_score(self, exploration_constant: float = 1.414) -> float:
-        if self.visits == 0:
-            return float("inf")
-        parent_visits = self.parent.visits if self.parent else self.visits
-        exploitation = self.q_value
-        exploration = exploration_constant * math.sqrt(math.log(parent_visits + 1) / self.visits)
-        return exploitation + exploration
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "node_id": self.node_id,
-            "parent_id": self.parent.node_id if self.parent else None,
-            "depth": self.depth,
-            "action": self.action,
-            "visits": self.visits,
-            "q_value": round(self.q_value, 4),
-            "reflection": self.reflection,
-            "feedback": self.feedback.model_dump() if self.feedback else None,
-            "is_terminal": self.is_terminal,
-        }
+    def mean_value(self) -> float:
+        return self.value_sum / self.visits if self.visits else 0.0
 
 
-class LATSResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    goal: str
-    grounded: bool
-    iterations_run: int
-    total_nodes_created: int
-    best_trajectory: List[Dict[str, Any]]
-    best_score: float
-    best_action: Dict[str, Any]
-    reflections_generated: List[str]
+@dataclass
+class LATSResult:
     success: bool
+    output: str
+    best_score: float
+    iterations: int
+    root: LATSNode
+    llm_calls: int = 0
+    tokens_used: int = 0
+    latency_s: float = 0.0
 
 
-def lats_search(
-    goal: str,
-    initial_request: Dict[str, Any],
-    environment: Optional[Any] = None,
-    max_iterations: int = 6,
-    max_depth: int = 3,
-    exploration_constant: float = 1.414,
-    llm: Optional[BaseChatModel] = None,
-    trace: Optional[RunTrace] = None,
+# ---------------------------------------------------------------------------
+# MCTS helpers (unchanged from toolkit)
+# ---------------------------------------------------------------------------
+
+def _uct(node: LATSNode, exploration_weight: float) -> float:
+    if node.visits == 0:
+        return float("inf")
+    parent_visits = max(node.parent.visits if node.parent else 1, 1)
+    return node.mean_value + exploration_weight * math.sqrt(math.log(parent_visits) / node.visits)
+
+
+def _select_leaf(root: LATSNode, exploration_weight: float) -> LATSNode:
+    node = root
+    while node.children:
+        node = max(node.children, key=lambda child: _uct(child, exploration_weight))
+    return node
+
+
+def _backpropagate(node: LATSNode, value: float) -> None:
+    while node is not None:
+        node.visits += 1
+        node.value_sum += value
+        node = node.parent
+
+
+def _trajectory_reflections(node: LATSNode) -> list[str]:
+    """Collect reflections from all ancestors."""
+    reflections: list[str] = []
+    current = node
+    while current is not None:
+        reflections.extend(current.reflections)
+        current = current.parent
+    return reflections
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
+_ACTION_SYSTEM = """\
+You are a Harborstone Insurance planning agent.
+Generate 2-3 alternative next actions to take toward solving the given insurance sub-task.
+Each action should be a concrete step (e.g., "Call check_vessel_eligibility with …",
+"Estimate premium using current_premium=X and vessel_value=Y", etc.).
+Ground every action in the available Harborstone MCP tools:
+  - get_customer_policies(customer_id)
+  - check_vessel_eligibility(vessel_type, year_built, value)
+  - estimate_policy_premium_change(current_premium, vessel_type, vessel_value)
+  - get_policy_update_requirements(vessel_type, vessel_value)
+"""
+
+_SIMULATE_SYSTEM = """\
+You are simulating the outcome of a Harborstone Insurance action.
+Given the current state and the proposed action, describe the resulting state
+as if the MCP tool was called and returned a realistic result.
+Be specific: include plausible numeric values, eligibility outcomes, and document lists.
+"""
+
+_VALUE_SYSTEM = """\
+You are evaluating the quality of a Harborstone Insurance agent state.
+Score the state 0.0-1.0:
+  1.0 → all needed data retrieved, eligibility confirmed, premium estimated, docs listed
+  0.7 → most data present but one piece missing
+  0.4 → significant gaps
+  0.0 → wrong tool used or contradicts business rules
+"""
+
+_REFLECT_SYSTEM = """\
+You are a Harborstone Insurance critic.
+The previous action failed or scored poorly.
+Write a concise verbal reflection (1-2 sentences) explaining:
+1. Why it failed (what business rule or schema check it violated)
+2. What the next action should do differently
+Be specific to Harborstone: mention vessel_type validity, premium positivity, or missing doc list.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Core LATS function — grounded with real Harborstone environment
+# ---------------------------------------------------------------------------
+
+def lats(
+    task: str,
+    llm: BaseChatModel,
+    environment: Environment,
+    *,
+    max_iterations: int = 5,
+    exploration_weight: float = 1.4,
+    task_id: str = "unknown",
+    context: dict[str, Any] | None = None,
 ) -> LATSResult:
     """
-    Run Language Agent Tree Search with MCTS and grounded environment feedback.
+    MCTS-guided LATS for a Harborstone high-stakes sub-task.
+
+    The four-phase loop:
+      1. SELECT    — UCT-based tree traversal to a leaf
+      2. EXPAND    — Generate 2-3 alternative actions from the leaf
+      3. SIMULATE  — Simulate outcome of each action
+      4. EVALUATE  — Score with REAL grounded environment (not random)
+      5. REFLECT   — Generate verbal reflection on failures
+      6. BACKPROP  — Update visit/value counts up the tree
+
+    Parameters
+    ----------
+    task : str
+        The sub-task (e.g. "Determine eligibility and estimate premium for vessel X").
+    llm : BaseChatModel
+        LangChain-compatible LLM.
+    environment : Environment
+        The grounded Harborstone environment (from environment.py).
+    max_iterations : int
+        MCTS budget.
+    exploration_weight : float
+        UCT exploration constant.
+    task_id : str
+        DAG node id for tracing.
+    context : dict
+        Upstream MCP results.
+
+    Returns
+    -------
+    LATSResult
     """
-    env = environment if environment is not None else GroundedEnvironment()
-    is_grounded = isinstance(env, GroundedEnvironment)
+    t0 = time.perf_counter()
+    ctx_text = ""
+    if context:
+        import json
+        ctx_text = "\n\nContext from upstream tasks:\n" + json.dumps(context, indent=2, default=str)
 
-    root = LATSNode(
-        node_id="root",
-        state=dict(initial_request),
-        parent=None,
-        depth=0,
-    )
+    full_task = f"{task}{ctx_text}"
+    root = LATSNode(state=f"Initial state: {task[:80]}")
+    llm_calls = 0
+    tokens = 0
+    best_node = root
+    best_score = -1.0
 
-    # Initial evaluation of root
-    root.feedback = env.evaluate_proposal(initial_request)
-    root.visits = 1
-    root.value_sum = root.feedback.score
+    def _add_tokens(resp: Any) -> None:
+        nonlocal tokens
+        if hasattr(resp, "usage_metadata") and resp.usage_metadata:
+            tokens += resp.usage_metadata.get("total_tokens", 0)
+        elif hasattr(resp, "response_metadata"):
+            meta = resp.response_metadata or {}
+            usage = meta.get("usage", {})
+            tokens += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
 
-    node_counter = 0
-    all_nodes: List[LATSNode] = [root]
-    all_reflections: List[str] = []
+    for iteration in range(max_iterations):
+        # --- PHASE 1: SELECT ---
+        leaf = _select_leaf(root, exploration_weight)
 
-    for iteration in range(1, max_iterations + 1):
-        # 1. Selection: Traverse down using UCT
-        curr = root
-        while curr.children and curr.depth < max_depth and not curr.is_terminal:
-            curr = max(curr.children, key=lambda child: child.uct_score(exploration_constant))
+        # --- PHASE 2: EXPAND — generate 2-3 actions ---
+        trajectory = _trajectory_reflections(leaf)
+        reflection_block = ""
+        if trajectory:
+            reflection_block = "\n\nPrior failure reflections (learn from these):\n" + \
+                               "\n".join(f"- {r}" for r in trajectory[-3:])
 
-        # If curr is terminal or at max depth, evaluate and backpropagate
-        if curr.is_terminal or curr.depth >= max_depth:
-            reward = curr.feedback.score if curr.feedback else 0.0
-            _backpropagate(curr, reward)
-            continue
+        action_resp = llm.with_structured_output(
+            LATSActionBatch,
+            method="json_schema",
+        ).invoke([
+            ("system", _ACTION_SYSTEM),
+            ("human", (
+                f"Task:\n{full_task}\n\n"
+                f"Current state:\n{leaf.state}"
+                f"{reflection_block}\n\n"
+                "Generate 2-3 alternative next actions."
+            )),
+        ])
+        llm_calls += 1
+        _add_tokens(action_resp)
 
-        # 2. Expansion & Simulation: Propose next candidate actions
-        # Collect prior reflections from failed attempts to steer exploration
-        past_reflections = [n.reflection for n in all_nodes if n.reflection]
-        candidate_actions = _generate_candidate_actions(curr.state, past_reflections, iteration)
+        for action_item in action_resp.actions:
+            # --- PHASE 3: SIMULATE ---
+            sim_resp = llm.invoke([
+                ("system", _SIMULATE_SYSTEM),
+                ("human", (
+                    f"Task:\n{full_task}\n\n"
+                    f"Current state:\n{leaf.state}\n\n"
+                    f"Action:\n{action_item.action}\n\n"
+                    "Describe the resulting state after this action."
+                )),
+            ])
+            llm_calls += 1
+            _add_tokens(sim_resp)
 
-        for act in candidate_actions:
-            node_counter += 1
-            nid = f"lats_n{node_counter}_iter{iteration}"
-            next_state = {**curr.state, **act}
+            sim_state = sim_resp.content if hasattr(sim_resp, "content") else str(sim_resp)
 
+            # --- PHASE 4A: EVALUATE with grounded environment ---
+            feedback = environment.evaluate(task=full_task, output=sim_state)
+
+            # --- PHASE 4B: Model value estimate ---
+            val_resp = llm.with_structured_output(
+                ValueEstimate,
+                method="json_schema",
+            ).invoke([
+                ("system", _VALUE_SYSTEM),
+                ("human", f"Task:\n{full_task}\n\nCurrent state:\n{sim_state}\n\nScore this state."),
+            ])
+            llm_calls += 1
+            _add_tokens(val_resp)
+
+            combined_score = 0.6 * feedback.score + 0.4 * val_resp.score
             child = LATSNode(
-                node_id=nid,
-                state=next_state,
-                parent=curr,
-                action=act,
-                depth=curr.depth + 1,
+                state=sim_state,
+                action=action_item.action,
+                parent=leaf,
+                environment_score=feedback.score,
+                model_score=val_resp.score,
+                feedback=feedback,
             )
+            leaf.children.append(child)
 
-            # 3. Evaluation & Reflection: REAL EXTERNAL FEEDBACK
-            fb = env.evaluate_proposal(next_state)
-            child.feedback = fb
-            child.is_terminal = fb.success or (child.depth >= max_depth)
+            # --- PHASE 4C: REFLECT on failure ---
+            if not feedback.success:
+                reflect_resp = llm.invoke([
+                    ("system", _REFLECT_SYSTEM),
+                    ("human", (
+                        f"Task:\n{full_task}\n\n"
+                        f"Failed state:\n{sim_state}\n\n"
+                        f"Environment feedback:\n{feedback.message}\n"
+                        f"Caught issues:\n" + "\n".join(f"- {i}" for i in feedback.caught_issues)
+                    )),
+                ])
+                llm_calls += 1
+                _add_tokens(reflect_resp)
+                reflection = reflect_resp.content if hasattr(reflect_resp, "content") else str(reflect_resp)
+                child.reflections.append(reflection)
 
-            # Generate verbal reflection if not fully successful
-            if not fb.success and fb.violations:
-                refl_text = f"Action {act.get('strategy', 'proposal')} failed underwriting: {'; '.join(fb.violations)}. Correction: ensure compliance with required rules."
-                child.reflection = refl_text
-                all_reflections.append(refl_text)
+            # --- PHASE 5: BACKPROPAGATE ---
+            _backpropagate(child, combined_score)
 
-            curr.children.append(child)
-            all_nodes.append(child)
+            if combined_score > best_score:
+                best_score = combined_score
+                best_node = child
 
-            # 4. Backpropagation
-            _backpropagate(child, fb.score)
-
-    # Extract best trajectory
-    best_leaf = max(all_nodes, key=lambda n: (n.feedback.score if n.feedback else 0.0, n.q_value))
-    best_path = _reconstruct_trajectory(best_leaf)
-
-    best_score = best_leaf.feedback.score if best_leaf.feedback else 0.0
-    best_success = best_leaf.feedback.success if best_leaf.feedback else False
-
-    result = LATSResult(
-        goal=goal,
-        grounded=is_grounded,
-        iterations_run=max_iterations,
-        total_nodes_created=len(all_nodes),
-        best_trajectory=[n.to_dict() for n in best_path],
-        best_score=best_score,
-        best_action=best_leaf.action or best_leaf.state,
-        reflections_generated=all_reflections,
-        success=best_success,
+    latency = time.perf_counter() - t0
+    return LATSResult(
+        success=best_score >= environment.success_threshold,
+        output=best_node.state,
+        best_score=round(best_score, 3),
+        iterations=max_iterations,
+        root=root,
+        llm_calls=llm_calls,
+        tokens_used=tokens,
+        latency_s=round(latency, 3),
     )
 
-    if trace is not None:
-        trace.execution.append({"method": "LATS", "nodes_created": len(all_nodes), "best_score": best_score})
 
-    return result
+# Alias
+lats_search = lats
 
-
-def _backpropagate(node: LATSNode, reward: float) -> None:
-    curr: Optional[LATSNode] = node
-    while curr is not None:
-        curr.visits += 1
-        curr.value_sum += reward
-        curr = curr.parent
-
-
-def _reconstruct_trajectory(node: LATSNode) -> List[LATSNode]:
-    path: List[LATSNode] = []
-    curr: Optional[LATSNode] = node
-    while curr is not None:
-        path.append(curr)
-        curr = curr.parent
-    return list(reversed(path))
-
-
-def _generate_candidate_actions(
-    state: Dict[str, Any], reflections: List[str], iteration: int
-) -> List[Dict[str, Any]]:
-    """
-    Generate domain-grounded candidate actions for Harborstone policy endorsements,
-    incorporating feedback and reflections from prior failed explorations.
-    """
-    vessel_type = state.get("vessel_type", state.get("new_vessel", {}).get("vessel_type", "Boat"))
-    vessel_value = float(state.get("vessel_value", state.get("new_vessel", {}).get("value", 100000.0)))
-    year_built = int(state.get("year_built", state.get("new_vessel", {}).get("year_built", 2024)))
-    current_premium = float(state.get("current_premium", 1200.0))
-
-    rate = 0.015 if vessel_type == "Yacht" else 0.010
-    correct_new_premium = round(current_premium + (vessel_value * rate), 2)
-
-    needs_survey = vessel_value >= 500000.0
-    needs_appraisal_reflection = any("appraisal" in r.lower() or "survey" in r.lower() for r in reflections)
-
-    actions = []
-
-    # Action 1: Compliant Standard Proposal
-    docs1 = ["Proof of ownership/purchase invoice", "Current vessel registration"]
-    if needs_survey or needs_appraisal_reflection:
-        docs1.append("Recent independent marine surveyor valuation report")
-
-    actions.append({
-        "strategy": "Compliant Actuarial Endorsement",
-        "vessel_type": vessel_type,
-        "year_built": year_built,
-        "vessel_value": vessel_value,
-        "current_premium": current_premium,
-        "proposed_premium": correct_new_premium,
-        "deductible": round(max(500.0, vessel_value * 0.05), 2),
-        "documents": docs1,
-    })
-
-    # Action 2: Premium Discount with Higher Compliant Deductible (10%)
-    actions.append({
-        "strategy": "High Deductible Cost Optimizer",
-        "vessel_type": vessel_type,
-        "year_built": year_built,
-        "vessel_value": vessel_value,
-        "current_premium": current_premium,
-        "proposed_premium": correct_new_premium,
-        "deductible": round(min(vessel_value * 0.10, vessel_value * 0.14), 2),
-        "documents": docs1,
-    })
-
-    # Action 3: Non-compliant probe (to test environment pruning) if early iteration
-    if iteration == 1 and not reflections:
-        actions.append({
-            "strategy": "Quick Endorsement Without Marine Survey",
-            "vessel_type": vessel_type,
-            "year_built": year_built,
-            "vessel_value": vessel_value,
-            "current_premium": current_premium,
-            "proposed_premium": correct_new_premium + 500.0,  # wrong premium calculation
-            "deductible": 250.0,  # below minimum
-            "documents": ["Proof of ownership"],  # missing survey
-        })
-
-    return actions

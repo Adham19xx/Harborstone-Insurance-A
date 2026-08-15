@@ -1,174 +1,221 @@
-"""Self-Refine Algorithm for Harborstone Insurance.
+"""
+self_refine.py — Self-Refine for Harborstone Insurance
+=====================================================================
+Adapted from AmrSheta22/task_decomposition_and_planning (planning_lab/algorithms/self_refine.py).
 
-Based on Madaan et al. (2023): 'Self-Refine: Iterative Refinement with Self-Feedback'.
+Keeps the original three-step flow:
+  1. DRAFT   — initial answer to the sub-task
+  2. CRITIQUE— check against an explicit Harborstone rubric (grounded)
+  3. REVISE  — produce an improved answer given the critique
 
-Self-Refine operates on sub-tasks that are fast and cheap to redo:
-1. Initial Draft: Generates a baseline solution or customer communication.
-2. Rubric Critique: Evaluates the draft against an explicit 4-point rubric.
-3. Revision: Updates the draft to address every identified critique point.
+Used for synthesis nodes whose output is cheap to regenerate:
+  "Summarise the policy update recommendation for the customer."
 
-Ideal for synthesizing customer notifications, endorsement summaries, and structured explanations.
+The rubric is GROUNDED against Harborstone business rules:
+  - Does it mention the estimated premium change (with a number)?
+  - Does it confirm or deny vessel eligibility?
+  - Does it list required documents?
+  - Is it at least 80 words (not a stub)?
+  - Does it address the customer by their policy context?
 """
 
 from __future__ import annotations
 
-import json
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
-from pydantic import BaseModel, ConfigDict, Field
+import re
+import time
+from dataclasses import dataclass
 
-from ..integration.trace import RunTrace
-
-if TYPE_CHECKING:
-    from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.language_models.chat_models import BaseChatModel
 
 
-class RubricCritique(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    accuracy_score: float = Field(ge=0.0, le=1.0)
-    clarity_score: float = Field(ge=0.0, le=1.0)
-    completeness_score: float = Field(ge=0.0, le=1.0)
-    regulatory_compliance_score: float = Field(ge=0.0, le=1.0)
-    identified_deficiencies: List[str] = Field(default_factory=list)
-    actionable_revision_instructions: str
+# ---------------------------------------------------------------------------
+# Grounded rubric checks (replaces the toolkit's generic text checks)
+# ---------------------------------------------------------------------------
+
+HARBORSTONE_RUBRIC = [
+    (
+        r"\$[\d,]+(?:\.\d+)?|\b[\d,]+(?:\.\d+)?\s*(?:USD|usd|per\s+year|annually)",
+        "premium_amount",
+        "Must cite a specific premium change amount (e.g. '$1,234 per year')."
+    ),
+    (
+        r"\b(eligible|ineligible|eligib|qualify|qualifies|does not qualify)\b",
+        "eligibility",
+        "Must state whether the vessel is eligible for the policy."
+    ),
+    (
+        r"\b(document|require|certificate|survey|inspection|proof)\b",
+        "documents",
+        "Must mention required documents or next steps."
+    ),
+    (
+        r"\b(vessel|ship|craft|boat)\b",
+        "vessel_mention",
+        "Must reference the vessel being assessed."
+    ),
+]
 
 
-class SelfRefineResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    task_goal: str
-    initial_draft: str
-    critique: RubricCritique
-    refined_output: str
-    improvements_made: List[str]
-    success: bool = True
-
-
-CRITIQUE_SYSTEM_PROMPT = """You are the Harborstone Insurance Compliance and Quality Critic.
-Critique the draft customer policy notification against this strict 4-point rubric:
-1. Accuracy: Are all numbers, vessel names, and premium figures exact?
-2. Clarity: Is the explanation concise and free of unnecessary jargon?
-3. Completeness: Are required documentation checklists clearly enumerated?
-4. Regulatory & Underwriting: Are approval disclaimers and next steps clearly articulated?
-Score each 0.0 to 1.0 and list specific improvements needed."""
-
-
-REVISION_SYSTEM_PROMPT = """You are the Harborstone Insurance Senior Underwriting Communicator.
-Revise the initial draft to strictly address every critique point and instruction provided by the compliance reviewer.
-Produce the final, polished response."""
-
-
-def self_refine(
-    task_goal: str,
-    context: Dict[str, Any],
-    llm: Optional[BaseChatModel] = None,
-    trace: Optional[RunTrace] = None,
-) -> SelfRefineResult:
+def harborstone_rubric_check(goal: str, draft: str) -> list[str]:
     """
-    Run the Self-Refine loop (Draft -> Critique -> Revise) on a synthesis or communication task.
+    Grounded rubric for Harborstone synthesis outputs.
+    Returns a list of issue strings (empty = no issues).
+
+    This replaces the toolkit's generic deterministic_checks().
     """
-    if llm is not None:
-        try:
-            # 1. Draft Phase
-            draft_prompt = f"Goal: {task_goal}\nContext: {json.dumps(context, default=str)}\nDraft a complete policy update summary."
-            draft_res = llm.invoke([("human", draft_prompt)])
-            initial_draft = draft_res.content if hasattr(draft_res, "content") else str(draft_res)
-            if trace is not None:
-                trace.add_llm_usage(draft_res)
+    issues: list[str] = []
+    lc = draft.lower()
 
-            # 2. Critique Phase
-            critique_prompt = f"Goal: {task_goal}\nContext Data: {json.dumps(context, default=str)}\nDraft to Critique:\n{initial_draft}"
-            critique = llm.with_structured_output(RubricCritique, method="json_schema").invoke(
-                [("system", CRITIQUE_SYSTEM_PROMPT), ("human", critique_prompt)]
+    for pattern, label, message in HARBORSTONE_RUBRIC:
+        if not re.search(pattern, lc, re.IGNORECASE):
+            issues.append(f"[{label}] {message}")
+
+    word_count = len(draft.split())
+    if word_count < 80:
+        issues.append(f"[length] Output is {word_count} words. Must be >= 80 words to be complete.")
+
+    return issues
+
+
+# ---------------------------------------------------------------------------
+# Data class
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ReflectionResult:
+    """Result of a Self-Refine run. Compatible with toolkit's ReflectionResult."""
+    draft: str
+    critique: str
+    revised: str
+    grounded_issues: list[str]          # from harborstone_rubric_check
+    llm_calls: int = 3                  # draft + critique + revise
+    tokens_used: int = 0
+    latency_s: float = 0.0
+    improved: bool = False              # True if revised passes rubric
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
+_CRITIQUE_SYSTEM = """\
+You are a Harborstone Insurance quality reviewer.
+You will receive a draft recommendation for a customer's policy update request.
+Critique it against this rubric:
+  1. Does it cite a specific premium change amount?
+  2. Does it state whether the vessel is eligible?
+  3. Does it list required documents or next steps?
+  4. Is it complete (at least 80 words)?
+  5. Does it mention the vessel?
+For each failed criterion, explain what is missing and how to fix it.
+Also list what the draft does well.
+"""
+
+_REVISE_SYSTEM = """\
+You are a Harborstone Insurance policy advisor.
+You will receive a draft recommendation and a critique.
+Write an improved recommendation that addresses every critique point.
+Keep what was already good. Do not invent data — use only the information
+provided in the draft and the task context.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Core function — interface matches toolkit's reflect_and_refine(goal, draft, llm)
+# ---------------------------------------------------------------------------
+
+def reflect_and_refine(
+    goal: str,
+    draft: str,
+    llm: BaseChatModel,
+    *,
+    task_id: str = "unknown",
+    context: str = "",
+) -> ReflectionResult:
+    """
+    Self-Refine for a Harborstone synthesis output.
+
+    Parameters
+    ----------
+    goal : str
+        The synthesis task instruction.
+    draft : str
+        The initial draft to be critiqued and revised.
+    llm : BaseChatModel
+        LangChain-compatible chat model.
+    task_id : str
+        DAG node id for tracing.
+    context : str
+        Additional context (upstream MCP results) as text.
+
+    Returns
+    -------
+    ReflectionResult
+    """
+    t0 = time.perf_counter()
+    tokens = 0
+
+    def _add_tokens(resp) -> None:
+        nonlocal tokens
+        if hasattr(resp, "usage_metadata") and resp.usage_metadata:
+            tokens += resp.usage_metadata.get("total_tokens", 0)
+        elif hasattr(resp, "response_metadata"):
+            meta = resp.response_metadata or {}
+            usage = meta.get("usage", {})
+            tokens += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+
+    # --- Step 1: Grounded rubric check (deterministic, no LLM) ---
+    grounded_issues = harborstone_rubric_check(goal, draft)
+
+    # --- Step 2: LLM critique (adds nuance beyond the rubric) ---
+    context_block = f"\n\nContext (MCP tool results):\n{context}" if context else ""
+    critique_resp = llm.invoke([
+        ("system", _CRITIQUE_SYSTEM),
+        ("human", (
+            f"Goal: {goal}{context_block}\n\n"
+            f"Draft:\n{draft}\n\n"
+            + (
+                "Grounded rubric failures already detected:\n"
+                + "\n".join(f"- {i}" for i in grounded_issues)
+                if grounded_issues
+                else "No rubric failures detected by automated checks."
             )
-            if trace is not None:
-                trace.add_llm_usage(critique)
+        )),
+    ])
+    _add_tokens(critique_resp)
+    critique_text = critique_resp.content if hasattr(critique_resp, "content") else str(critique_resp)
 
-            # 3. Revision Phase
-            revision_prompt = f"""Original Draft:\n{initial_draft}\n
-Compliance Review Critique:
-- Identified Deficiencies: {critique.identified_deficiencies}
-- Instructions: {critique.actionable_revision_instructions}
+    # --- Step 3: Revision ---
+    revise_resp = llm.invoke([
+        ("system", _REVISE_SYSTEM),
+        ("human", (
+            f"Goal: {goal}{context_block}\n\n"
+            f"Original Draft:\n{draft}\n\n"
+            f"Critique:\n{critique_text}\n\n"
+            "Write the improved recommendation."
+        )),
+    ])
+    _add_tokens(revise_resp)
+    revised_text = revise_resp.content if hasattr(revise_resp, "content") else str(revise_resp)
 
-Produce the final revised output."""
-            refined_res = llm.invoke([("system", REVISION_SYSTEM_PROMPT), ("human", revision_prompt)])
-            refined_output = refined_res.content if hasattr(refined_res, "content") else str(refined_res)
-            if trace is not None:
-                trace.add_llm_usage(refined_res)
+    # Did the revision fix the rubric issues?
+    remaining_issues = harborstone_rubric_check(goal, revised_text)
+    improved = len(remaining_issues) < len(grounded_issues)
 
-            return SelfRefineResult(
-                task_goal=task_goal,
-                initial_draft=initial_draft,
-                critique=critique,
-                refined_output=refined_output,
-                improvements_made=critique.identified_deficiencies,
-                success=True,
-            )
-        except Exception as exc:
-            if trace is not None:
-                trace.plan_changes.append({"event": "self_refine_fallback", "error": str(exc)})
-
-    # High quality deterministic self-refine implementation
-    return _deterministic_self_refine(task_goal, context)
-
-
-def _deterministic_self_refine(task_goal: str, context: Dict[str, Any]) -> SelfRefineResult:
-    vessel_name = context.get("vessel_name", context.get("new_vessel", {}).get("vessel_name", "Vessel"))
-    vessel_type = context.get("vessel_type", context.get("new_vessel", {}).get("vessel_type", "Yacht"))
-    vessel_value = float(context.get("vessel_value", context.get("new_vessel", {}).get("value", 500000.0)))
-    total_premium = float(context.get("total_new_premium", context.get("proposed_premium", 8700.0)))
-    docs = context.get("documents", context.get("required_documents", ["Proof of purchase", "Registration"]))
-
-    # Step 1: Initial rough draft (missing specific disclaimers and structured list)
-    initial_draft = (
-        f"Hello. We received your request to add your {vessel_name} ({vessel_type}) valued at ${vessel_value:,.2f}. "
-        f"Your updated policy premium is estimated at ${total_premium:,.2f}. Please provide your paperwork so we can finish this."
+    latency = time.perf_counter() - t0
+    return ReflectionResult(
+        draft=draft,
+        critique=critique_text,
+        revised=revised_text,
+        grounded_issues=grounded_issues,
+        llm_calls=3,
+        tokens_used=tokens,
+        latency_s=round(latency, 3),
+        improved=improved,
     )
 
-    # Step 2: Explicit Rubric Critique
-    critique = RubricCritique(
-        accuracy_score=0.90,
-        clarity_score=0.75,
-        completeness_score=0.60,
-        regulatory_compliance_score=0.65,
-        identified_deficiencies=[
-            "Missing itemized required documentation checklist.",
-            "Lacks formal underwriting approval disclaimer.",
-            "Does not specify effective start dates or deductible details.",
-        ],
-        actionable_revision_instructions=(
-            "Add a bulleted list of all required verification documents (including survey if value >= $500k), "
-            "include policy timeline, and state that final binding requires underwriter confirmation."
-        ),
-    )
 
-    # Step 3: Revised, comprehensive professional output
-    doc_lines = "\n".join(f"  • {d}" for d in docs)
-    refined_output = f"""=== HARBORSTONE MARINE INSURANCE POLICY UPDATE NOTICE ===
+# Aliases
+self_refine = reflect_and_refine
+SelfRefineResult = ReflectionResult
 
-Dear Valued Policyholder,
-
-Thank you for contacting Harborstone Insurance regarding the addition of your newly acquired vessel to your active marine policy.
-
-Vessel & Coverage Details:
-• Vessel Name: {vessel_name}
-• Vessel Type: {vessel_type}
-• Declared Hull Value: ${vessel_value:,.2f}
-• Estimated New Annual Premium: ${total_premium:,.2f}
-
-Next Steps & Required Documentation:
-To finalize and bind coverage for your vessel, please submit the following documents to your underwriting officer:
-{doc_lines}
-
-Important Underwriting Notice:
-This estimate is subject to formal verification of documentation and vessel inspection standards. Coverage is officially bound once written confirmation is issued by a Harborstone Marine Underwriter.
-
-Sincerely,
-Harborstone Marine Underwriting Team"""
-
-    return SelfRefineResult(
-        task_goal=task_goal,
-        initial_draft=initial_draft,
-        critique=critique,
-        refined_output=refined_output,
-        improvements_made=critique.identified_deficiencies,
-        success=True,
-    )

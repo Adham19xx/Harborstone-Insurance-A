@@ -1,313 +1,206 @@
-"""Tree of Thoughts (ToT) Planning Algorithm for Harborstone Insurance.
+"""
+tree_of_thoughts.py — Tree of Thoughts for Harborstone Insurance
+=====================================================================
+Adapted from AmrSheta22/task_decomposition_and_planning.
+Keeps the original generate/evaluate/BFS-search loop.
+Used for Harborstone SYNTHESIS nodes where several alternative
+response strategies exist (e.g. "How should we phrase the premium
+change recommendation to the customer?").
 
-Based on Yao et al. (2023): 'Tree of Thoughts: Deliberate Problem Solving with Large Language Models'.
-
-ToT allows exploration over multiple reasoning paths by:
-1. Thought Generation: Proposing k candidate next steps / actions.
-2. Thought Evaluation: Scoring candidates against domain rubrics (e.g. risk level, cost-efficiency, policy fit).
-3. Tree Search: Breadth-First Search (BFS) with beam pruning or Depth-First Search (DFS) with backtracking.
-
-Ideal for complex multi-choice reasoning tasks such as multi-vessel risk ranking,
-endorsement prioritization, and deductible vs coverage tradeoff optimization.
+Router rule (see router.py):
+  ToT → synthesis nodes that need lookahead / comparing alternatives
 """
 
 from __future__ import annotations
 
-import json
-from typing import Any, Dict, List, Optional, Literal, TYPE_CHECKING
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..integration.trace import RunTrace
 
-if TYPE_CHECKING:
-    from langchain_core.language_models.chat_models import BaseChatModel
+# ---------------------------------------------------------------------------
+# Pydantic models — compatible with toolkit's Thought model
+# ---------------------------------------------------------------------------
 
-
-class ThoughtNode(BaseModel):
-    """A node in the Tree of Thoughts."""
+class ThoughtCandidates(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    node_id: str
-    parent_id: Optional[str] = None
-    depth: int = 0
-    thought: str
-    action_or_decision: Dict[str, Any] = Field(default_factory=dict)
-    score: float = Field(default=0.0, ge=0.0, le=1.0)
-    evaluation_notes: str = ""
-    is_pruned: bool = False
-    is_terminal: bool = False
-
-
-class CandidateThoughts(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    candidates: List[str] = Field(min_length=1)
+    candidates: list[str] = Field(min_length=1, max_length=3)
 
 
 class ThoughtEvaluation(BaseModel):
     model_config = ConfigDict(extra="forbid")
     score: float = Field(ge=0.0, le=1.0)
-    critique: str
-    viable: bool
+    rationale: str
 
 
-class ToTResult(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    goal: str
-    search_strategy: str
-    total_nodes_explored: int
-    best_path: List[ThoughtNode]
-    best_score: float
-    best_solution: Dict[str, Any]
-    tree_nodes: List[ThoughtNode]
+@dataclass
+class Thought:
+    """A node in the ToT search tree."""
+    state: str
+    score: float = 0.5
+    rationale: str = ""
+    depth: int = 0
+    parent_state: str = ""
+    children: list["Thought"] = field(default_factory=list)
+
+
+@dataclass
+class ToTResult:
+    best_thought: Thought
+    all_thoughts: list[Thought]
+    llm_calls: int
+    tokens_used: int
+    latency_s: float
     success: bool = True
 
 
-TOT_GENERATE_SYSTEM = """You are the Harborstone Marine Risk & Policy Optimization Strategist.
-Given a complex insurance decision or multi-option trade-off task:
-Generate 2-3 distinct, well-reasoned candidate next thoughts/options to explore.
-Ensure the options explore different viable tradeoffs (e.g. conservative risk vs cost savings vs comprehensive coverage)."""
+# ---------------------------------------------------------------------------
+# Core BFS Tree-of-Thoughts (preserves toolkit interface)
+# ---------------------------------------------------------------------------
 
-TOT_EVAL_SYSTEM = """You are the Harborstone Underwriting Critic.
-Evaluate the proposed thought/option against Harborstone policy guidelines:
-1. Risk Adequacy: Does it protect against total loss and liability?
-2. Financial Feasibility: Is the premium/deductible reasonable for the vessel value?
-3. Compliance: Does it meet age, documentation, and regulatory standards?
-Return a score between 0.0 (unacceptable/high risk) and 1.0 (optimal) and clear critique."""
+_GENERATE_SYSTEM = """\
+You are a Harborstone Insurance response strategist.
+Given the current state of solving a marine insurance sub-task, generate
+2-3 distinct candidate next steps or response approaches.
+Each candidate should be meaningfully different (not paraphrases).
+Harborstone context:
+- Always ground recommendations in policy data retrieved from MCP tools
+- Premium changes must be justified numerically
+- Document requirements come from get_policy_update_requirements
+"""
+
+_EVALUATE_SYSTEM = """\
+You are a Harborstone Insurance quality evaluator.
+Score the candidate response step from 0.0 (terrible) to 1.0 (perfect).
+Evaluation rubric:
+  0.8-1.0 : Cites specific numbers, mentions eligibility, lists required docs
+  0.5-0.8 : Partially complete, missing some specifics
+  0.0-0.5 : Vague, missing key information, or factually wrong
+Be strict. A score > 0.8 is reserved for responses that cite real data.
+"""
 
 
-def tree_of_thoughts_search(
-    goal: str,
-    context: Dict[str, Any],
-    search_strategy: Literal["BFS", "DFS"] = "BFS",
-    max_depth: int = 3,
-    branching_factor: int = 3,
+def tree_of_thoughts(
+    problem: str,
+    llm: BaseChatModel,
+    *,
+    depth: int = 2,
     beam_width: int = 2,
-    llm: Optional[BaseChatModel] = None,
-    trace: Optional[RunTrace] = None,
+    task_id: str = "unknown",
+    context: dict[str, Any] | None = None,
 ) -> ToTResult:
     """
-    Execute Tree of Thoughts search (BFS or DFS) on a reasoning task.
+    BFS Tree-of-Thoughts search for the best Harborstone synthesis response.
+
+    Parameters
+    ----------
+    problem : str
+        The synthesis task (e.g. "Summarise the policy update recommendation").
+    llm : BaseChatModel
+        LangChain-compatible chat model.
+    depth : int
+        BFS depth (how many rounds of generate/evaluate).
+    beam_width : int
+        How many best thoughts to keep per level.
+    task_id : str
+        DAG node id for tracing.
+    context : dict
+        Upstream MCP tool results to include in the problem description.
+
+    Returns
+    -------
+    ToTResult
     """
-    all_nodes: List[ThoughtNode] = []
-    root = ThoughtNode(
-        node_id="root",
-        parent_id=None,
-        depth=0,
-        thought=f"Initial State for goal: {goal}",
-        action_or_decision=context,
-        score=1.0,
-    )
-    all_nodes.append(root)
+    t0 = time.perf_counter()
+    ctx_text = ""
+    if context:
+        import json
+        ctx_text = "\n\nData from MCP tools:\n" + json.dumps(context, indent=2, default=str)
 
-    if llm is not None:
-        try:
-            if search_strategy == "BFS":
-                return _tot_bfs_llm(goal, context, max_depth, branching_factor, beam_width, llm, trace)
-            else:
-                return _tot_dfs_llm(goal, context, max_depth, branching_factor, llm, trace)
-        except Exception as exc:
-            if trace is not None:
-                trace.plan_changes.append({"event": "tot_fallback", "error": str(exc)})
+    full_problem = f"{problem}{ctx_text}"
 
-    # Deterministic search engine for test reproducibility and zero-API environments
-    return _deterministic_tot_search(goal, context, search_strategy, max_depth, branching_factor, beam_width)
-
-
-def _tot_bfs_llm(
-    goal: str,
-    context: Dict[str, Any],
-    max_depth: int,
-    branching_factor: int,
-    beam_width: int,
-    llm: BaseChatModel,
-    trace: Optional[RunTrace],
-) -> ToTResult:
-    all_nodes: List[ThoughtNode] = []
-    root = ThoughtNode(node_id="root", depth=0, thought="Root", action_or_decision=context, score=1.0)
-    all_nodes.append(root)
-    current_beam: List[ThoughtNode] = [root]
-
-    node_counter = 0
-
-    for depth in range(1, max_depth + 1):
-        candidates: List[ThoughtNode] = []
-        for parent in current_beam:
-            gen_prompt = f"""Goal: {goal}
-Current Reasoning Depth: {depth}/{max_depth}
-Parent Step: {parent.thought}
-Context: {json.dumps(parent.action_or_decision, default=str)}
-
-Generate {branching_factor} diverse candidate next thoughts or endorsement options."""
-
-            gen_res = llm.with_structured_output(CandidateThoughts, method="json_schema").invoke(
-                [("system", TOT_GENERATE_SYSTEM), ("human", gen_prompt)]
-            )
-            if trace is not None:
-                trace.add_llm_usage(gen_res)
-
-            for cand_text in gen_res.candidates[:branching_factor]:
-                node_counter += 1
-                nid = f"n_d{depth}_{node_counter}"
-
-                eval_prompt = f"""Goal: {goal}
-Candidate Thought: {cand_text}
-Context: {json.dumps(parent.action_or_decision, default=str)}
-
-Evaluate this candidate thought and assign a score (0.0 - 1.0)."""
-
-                eval_res = llm.with_structured_output(ThoughtEvaluation, method="json_schema").invoke(
-                    [("system", TOT_EVAL_SYSTEM), ("human", eval_prompt)]
-                )
-                if trace is not None:
-                    trace.add_llm_usage(eval_res)
-
-                node = ThoughtNode(
-                    node_id=nid,
-                    parent_id=parent.node_id,
-                    depth=depth,
-                    thought=cand_text,
-                    action_or_decision={**parent.action_or_decision, f"step_{depth}": cand_text},
-                    score=eval_res.score,
-                    evaluation_notes=eval_res.critique,
-                    is_pruned=not eval_res.viable,
-                    is_terminal=(depth == max_depth),
-                )
-                candidates.append(node)
-                all_nodes.append(node)
-
-        # Prune and select top beam_width nodes
-        viable_candidates = [c for c in candidates if not c.is_pruned]
-        if not viable_candidates:
-            viable_candidates = candidates  # keep best even if borderline
-
-        viable_candidates.sort(key=lambda x: x.score, reverse=True)
-        current_beam = viable_candidates[:beam_width]
-
-        for c in candidates:
-            if c not in current_beam:
-                c.is_pruned = True
-
-    best_node = max(all_nodes, key=lambda x: (x.depth, x.score))
-    best_path = _reconstruct_path(best_node, all_nodes)
-
-    return ToTResult(
-        goal=goal,
-        search_strategy="BFS",
-        total_nodes_explored=len(all_nodes),
-        best_path=best_path,
-        best_score=best_node.score,
-        best_solution=best_node.action_or_decision,
-        tree_nodes=all_nodes,
-        success=True,
-    )
-
-
-def _tot_dfs_llm(
-    goal: str,
-    context: Dict[str, Any],
-    max_depth: int,
-    branching_factor: int,
-    llm: BaseChatModel,
-    trace: Optional[RunTrace],
-) -> ToTResult:
-    # Use deterministic DFS fallback logic with LLM evaluations
-    return _deterministic_tot_search(goal, context, "DFS", max_depth, branching_factor, 1)
-
-
-def _deterministic_tot_search(
-    goal: str,
-    context: Dict[str, Any],
-    search_strategy: str,
-    max_depth: int,
-    branching_factor: int,
-    beam_width: int,
-) -> ToTResult:
-    """Deterministic, high-quality Tree of Thoughts search implementation."""
-    all_nodes: List[ThoughtNode] = []
-    root = ThoughtNode(node_id="root", depth=0, thought="Assess customer portfolio & vessel addition", action_or_decision=context, score=1.0)
-    all_nodes.append(root)
-
-    # Strategy space for Harborstone risk/portfolio ranking
-    thought_templates = [
-        # Depth 1 options: Deductible / Risk strategy
-        [
-            ("Option A: Standard 2.5% Deductible with full Hull & Machinery coverage", {"deductible_ratio": 0.025, "coverage": "Full H&M"}, 0.88, "Balanced risk and premium."),
-            ("Option B: High 10.0% Deductible with 15% Premium Discount", {"deductible_ratio": 0.10, "coverage": "Full H&M + Discount"}, 0.94, "Highly cost-effective for experienced yacht owners."),
-            ("Option C: Low $500 Deductible with High Risk Surcharge", {"deductible_ratio": 0.005, "coverage": "Low Deductible"}, 0.65, "High loss exposure for insurer; excessive premium."),
-        ],
-        # Depth 2 options: Endorsement options
-        [
-            ("Add Navigational Limits Endorsement (Coastal Waters only)", {"endorsement": "Coastal Only", "risk_reduction": 0.10}, 0.95, "Reduces navigation hazard and premium."),
-            ("Add Worldwide Open Sea Endorsement", {"endorsement": "Worldwide", "risk_reduction": -0.20}, 0.72, "Increases offshore salvage exposure."),
-            ("Standard Regional Endorsement", {"endorsement": "Regional Waters", "risk_reduction": 0.0}, 0.85, "Standard baseline endorsement."),
-        ],
-        # Depth 3 options: Payment / Underwriting Sign-off
-        [
-            ("Annual Upfront Payment with 5% Fleet Loyalty Credit", {"payment_terms": "Annual Upfront", "loyalty_discount": 0.05}, 0.96, "Optimal cash flow and customer retention."),
-            ("Quarterly Installments with Standard Admin Fee", {"payment_terms": "Quarterly", "admin_fee": 150.0}, 0.84, "Standard consumer terms."),
-            ("Monthly Financing with Third-Party Lienholder", {"payment_terms": "Monthly Financed", "admin_fee": 300.0}, 0.78, "Higher administrative burden."),
-        ]
+    # Seed the frontier with the root node
+    frontier: list[Thought] = [
+        Thought(state=f"Initial approach to: {problem[:80]}", score=0.5, rationale="root", depth=0)
     ]
 
-    current_layer = [root]
-    node_id_seq = 1
+    all_thoughts: list[Thought] = list(frontier)
+    llm_calls = 0
+    tokens = 0
 
-    for d in range(min(max_depth, len(thought_templates))):
-        layer_templates = thought_templates[d][:branching_factor]
-        next_layer: List[ThoughtNode] = []
+    def _add_tokens(resp: Any) -> None:
+        nonlocal tokens
+        if hasattr(resp, "usage_metadata") and resp.usage_metadata:
+            tokens += resp.usage_metadata.get("total_tokens", 0)
+        elif hasattr(resp, "response_metadata"):
+            meta = resp.response_metadata or {}
+            usage = meta.get("usage", {})
+            tokens += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
 
-        for parent in current_layer:
-            for text, decision_delta, score, critique in layer_templates:
-                node_id = f"node_{d+1}_{node_id_seq}"
-                node_id_seq += 1
-                combined_decision = {**parent.action_or_decision, **decision_delta}
-                node = ThoughtNode(
-                    node_id=node_id,
-                    parent_id=parent.node_id,
+    for d in range(depth):
+        candidates: list[Thought] = []
+        for parent in frontier:
+            # --- Generate ---
+            gen_resp = llm.with_structured_output(
+                ThoughtCandidates,
+                method="json_schema",
+            ).invoke([
+                ("system", _GENERATE_SYSTEM),
+                ("human", (
+                    f"Problem:\n{full_problem}\n\n"
+                    f"Current approach:\n{parent.state}\n\n"
+                    "Generate 2-3 candidate next steps."
+                )),
+            ])
+            llm_calls += 1
+            _add_tokens(gen_resp)
+
+            for cand_text in gen_resp.candidates:
+                # --- Evaluate ---
+                eval_resp = llm.with_structured_output(
+                    ThoughtEvaluation,
+                    method="json_schema",
+                ).invoke([
+                    ("system", _EVALUATE_SYSTEM),
+                    ("human", (
+                        f"Problem:\n{full_problem}\n\n"
+                        f"Candidate step:\n{cand_text}\n\n"
+                        "Score this candidate (0.0-1.0) with rationale."
+                    )),
+                ])
+                llm_calls += 1
+                _add_tokens(eval_resp)
+
+                thought = Thought(
+                    state=cand_text,
+                    score=eval_resp.score,
+                    rationale=eval_resp.rationale,
                     depth=d + 1,
-                    thought=text,
-                    action_or_decision=combined_decision,
-                    score=score,
-                    evaluation_notes=critique,
-                    is_pruned=False,
-                    is_terminal=(d + 1 == max_depth),
+                    parent_state=parent.state,
                 )
-                all_nodes.append(node)
-                next_layer.append(node)
+                parent.children.append(thought)
+                candidates.append(thought)
+                all_thoughts.append(thought)
 
-        # Beam pruning for BFS
-        if search_strategy == "BFS":
-            next_layer.sort(key=lambda x: x.score, reverse=True)
-            for item in next_layer[beam_width:]:
-                item.is_pruned = True
-            current_layer = next_layer[:beam_width]
-        else:
-            # DFS keeps top 1 branch at each depth
-            next_layer.sort(key=lambda x: x.score, reverse=True)
-            for item in next_layer[1:]:
-                item.is_pruned = True
-            current_layer = next_layer[:1]
+        # BFS: keep top beam_width by score
+        frontier = sorted(candidates, key=lambda t: t.score, reverse=True)[:beam_width]
 
-    terminal_nodes = [n for n in all_nodes if n.depth == min(max_depth, len(thought_templates)) and not n.is_pruned]
-    best_node = max(terminal_nodes or all_nodes, key=lambda x: x.score)
-    best_path = _reconstruct_path(best_node, all_nodes)
+    best = max(all_thoughts, key=lambda t: t.score)
+    latency = time.perf_counter() - t0
 
     return ToTResult(
-        goal=goal,
-        search_strategy=search_strategy,
-        total_nodes_explored=len(all_nodes),
-        best_path=best_path,
-        best_score=best_node.score,
-        best_solution=best_node.action_or_decision,
-        tree_nodes=all_nodes,
-        success=True,
+        best_thought=best,
+        all_thoughts=all_thoughts,
+        llm_calls=llm_calls,
+        tokens_used=tokens,
+        latency_s=round(latency, 3),
+        success=best.score >= 0.5,
     )
 
 
-def _reconstruct_path(node: ThoughtNode, all_nodes: List[ThoughtNode]) -> List[ThoughtNode]:
-    node_map = {n.node_id: n for n in all_nodes}
-    path: List[ThoughtNode] = []
-    curr: Optional[ThoughtNode] = node
-    while curr:
-        path.append(curr)
-        curr = node_map.get(curr.parent_id) if curr.parent_id else None
-    return list(reversed(path))
+# Alias
+tree_of_thoughts_search = tree_of_thoughts
+
