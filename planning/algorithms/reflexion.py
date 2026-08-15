@@ -272,3 +272,8 @@ def reflexion(
         tokens_used=tokens,
         latency_s=round(latency, 3),
     )
+
+
+# Alias
+run_reflexion = reflexion
+

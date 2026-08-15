@@ -118,3 +118,29 @@ def explain_routing(kind: str, tool_name: str | None) -> str:
         ),
     }
     return f"[Router] {algo.upper()}: {reasons[algo]}"
+
+
+from dataclasses import dataclass
+
+@dataclass
+class RoutingDecision:
+    task_id: str
+    instruction: str
+    selected_method: str
+    rationale: str
+    estimated_complexity: str = "O(1)"
+
+
+def route_subtask(task_id: str, instruction: str, context: dict | None = None) -> RoutingDecision:
+    ctx = context or {}
+    kind = ctx.get("kind", "mcp")
+    tool_name = ctx.get("tool_name")
+    method = classify_subtask(kind, tool_name, instruction)
+    explanation = explain_routing(kind, tool_name)
+    return RoutingDecision(
+        task_id=task_id,
+        instruction=instruction,
+        selected_method=method,
+        rationale=explanation,
+    )
+

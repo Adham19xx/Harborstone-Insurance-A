@@ -328,3 +328,8 @@ def lats(
         tokens_used=tokens,
         latency_s=round(latency, 3),
     )
+
+
+# Alias
+lats_search = lats
+

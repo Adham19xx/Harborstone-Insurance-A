@@ -1,5 +1,73 @@
-"""Harborstone Week 4 planning extension.
+"""Harborstone Insurance Week 4 Autonomous Decomposition & Planning System.
 
-Decomposition/DAG modules are adapted from the required reference toolkit:
-AmrSheta22/task_decomposition_and_planning.
+Unified package interface exporting all planning algorithms, models, environment,
+and integration components.
 """
+
+from .models import Task, Plan
+from .environment import (
+    GroundedEnvironment,
+    UngroundedEnvironment,
+    EnvironmentFeedback,
+    UnderwritingRules,
+)
+from .algorithms import (
+    decompose_goal,
+    execute_plan,
+    final_output,
+    dynamic_decomposition,
+    plan_and_solve,
+    PlanAndSolveResult,
+    tree_of_thoughts_search,
+    ToTResult,
+    lats_search,
+    LATSResult,
+    route_subtask,
+    RoutingDecision,
+    self_refine,
+    SelfRefineResult,
+    run_reflexion,
+    ReflexionResult,
+)
+from .integration.trace import RunTrace
+from .integration.mcp_executor import HarborstoneMCPExecutor
+from .requests.harborstone_requests import (
+    REAL_REQUESTS,
+    ELIGIBLE_REQUEST,
+    INELIGIBLE_REQUEST,
+)
+
+__all__ = [
+    # Models & DAGs
+    "Task",
+    "Plan",
+    # Environment & Validation
+    "GroundedEnvironment",
+    "UngroundedEnvironment",
+    "EnvironmentFeedback",
+    "UnderwritingRules",
+    # Algorithms
+    "decompose_goal",
+    "execute_plan",
+    "final_output",
+    "dynamic_decomposition",
+    "plan_and_solve",
+    "PlanAndSolveResult",
+    "tree_of_thoughts_search",
+    "ToTResult",
+    "lats_search",
+    "LATSResult",
+    "route_subtask",
+    "RoutingDecision",
+    "self_refine",
+    "SelfRefineResult",
+    "run_reflexion",
+    "ReflexionResult",
+    # Integration & Traces
+    "RunTrace",
+    "HarborstoneMCPExecutor",
+    # Fixtures
+    "REAL_REQUESTS",
+    "ELIGIBLE_REQUEST",
+    "INELIGIBLE_REQUEST",
+]

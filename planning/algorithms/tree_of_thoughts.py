@@ -199,3 +199,8 @@ def tree_of_thoughts(
         latency_s=round(latency, 3),
         success=best.score >= 0.5,
     )
+
+
+# Alias
+tree_of_thoughts_search = tree_of_thoughts
+

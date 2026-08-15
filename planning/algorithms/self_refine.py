@@ -213,3 +213,9 @@ def reflect_and_refine(
         latency_s=round(latency, 3),
         improved=improved,
     )
+
+
+# Aliases
+self_refine = reflect_and_refine
+SelfRefineResult = ReflectionResult
+

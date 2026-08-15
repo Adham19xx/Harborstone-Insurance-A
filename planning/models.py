@@ -81,10 +81,6 @@ class Plan(BaseModel):
     def terminal_tasks(self) -> list[str]:
         return [node for node, degree in self.graph.out_degree if degree == 0]
 
+# Re-export EnvironmentFeedback from environment.py to avoid duplicate definitions
+from .environment import EnvironmentFeedback
 
-class EnvironmentFeedback(BaseModel):
-    """Reference-toolkit feedback model retained for future grounded planning methods."""
-    model_config = ConfigDict(extra="forbid")
-    success: bool
-    score: float = Field(ge=0.0, le=1.0)
-    details: list[str] = Field(default_factory=list)

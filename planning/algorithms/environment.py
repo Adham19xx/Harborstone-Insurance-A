@@ -36,9 +36,19 @@ class EnvironmentFeedback:
     score: float                          # 0.0 – 1.0  (grounded, not random)
     success: bool                         # score >= threshold
     message: str                          # human-readable explanation
-    grounding_source: str                 # what we checked against
+    grounding_source: str = "Harborstone Grounded Engine"
     caught_issues: list[str] = field(default_factory=list)   # failures found
     passed_checks: list[str] = field(default_factory=list)   # checks passed
+
+    @property
+    def violations(self) -> list[str]:
+        return self.caught_issues
+
+    @property
+    def details(self) -> list[str]:
+        return self.passed_checks
+
+
 
 
 # ---------------------------------------------------------------------------

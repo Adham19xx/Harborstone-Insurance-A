@@ -26,6 +26,7 @@ from typing import Any
 
 @dataclass
 class TestCase:
+    __test__ = False
     id: str
     description: str
     request: str
@@ -33,6 +34,7 @@ class TestCase:
     expected_methods: list[str]    # which algorithms this case exercises
     min_success_score: float = 0.65
     tags: list[str] = field(default_factory=list)
+
 
 
 # ---------------------------------------------------------------------------
