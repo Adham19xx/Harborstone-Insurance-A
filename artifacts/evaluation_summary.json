@@ -1,0 +1,66 @@
+[
+  {
+    "Method": "Decomposition-First",
+    "Task Success": "12/15 (80.0%)",
+    "Avg LLM Calls": "5.0",
+    "Avg Tokens": "6,335",
+    "Avg Latency": "0.28s",
+    "Est Cost/Run": "$0.038"
+  },
+  {
+    "Method": "Dynamic Decomposition",
+    "Task Success": "15/15 (100.0%)",
+    "Avg LLM Calls": "5.6",
+    "Avg Tokens": "7,913",
+    "Avg Latency": "0.46s",
+    "Est Cost/Run": "$0.059"
+  },
+  {
+    "Method": "Plan-and-Solve (PS)",
+    "Task Success": "15/15 (100.0%)",
+    "Avg LLM Calls": "1.0",
+    "Avg Tokens": "1,450",
+    "Avg Latency": "0.12s",
+    "Est Cost/Run": "$0.010"
+  },
+  {
+    "Method": "Tree of Thoughts (ToT)",
+    "Task Success": "15/15 (100.0%)",
+    "Avg LLM Calls": "16.0",
+    "Avg Tokens": "5,400",
+    "Avg Latency": "0.39s",
+    "Est Cost/Run": "$0.038"
+  },
+  {
+    "Method": "LATS (Ungrounded Env)",
+    "Task Success": "12/15 (80.0%)",
+    "Avg LLM Calls": "8.0",
+    "Avg Tokens": "6,900",
+    "Avg Latency": "0.52s",
+    "Est Cost/Run": "$0.052"
+  },
+  {
+    "Method": "LATS (Grounded Env)",
+    "Task Success": "12/15 (80.0%)",
+    "Avg LLM Calls": "10.0",
+    "Avg Tokens": "8,100",
+    "Avg Latency": "0.64s",
+    "Est Cost/Run": "$0.065"
+  },
+  {
+    "Method": "Self-Refine",
+    "Task Success": "15/15 (100.0%)",
+    "Avg LLM Calls": "3.0",
+    "Avg Tokens": "3,100",
+    "Avg Latency": "0.24s",
+    "Est Cost/Run": "$0.022"
+  },
+  {
+    "Method": "Reflexion (Multi-Trial)",
+    "Task Success": "12/15 (80.0%)",
+    "Avg LLM Calls": "4.4",
+    "Avg Tokens": "5,720",
+    "Avg Latency": "0.58s",
+    "Est Cost/Run": "$0.042"
+  }
+]
