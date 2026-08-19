@@ -68,4 +68,56 @@ CREATE TABLE Payments (
     status VARCHAR(20),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (policy_id) REFERENCES Policies(policy_id)
+);     
+
+-- ==========================================
+-- State Graph Persistence
+-- ==========================================
+
+CREATE TABLE GraphRuns (
+    run_id VARCHAR(100) PRIMARY KEY,
+    graph_name VARCHAR(100) NOT NULL,
+
+    customer_id INT NULL,
+    policy_id INT NULL,
+    claim_id INT NULL,
+    vessel_id INT NULL,
+
+    current_state VARCHAR(100) NOT NULL,
+    status VARCHAR(50) NOT NULL,
+
+    checkpoint_version INT NOT NULL DEFAULT 0,
+
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (customer_id) REFERENCES Customers(customer_id),
+    FOREIGN KEY (policy_id) REFERENCES Policies(policy_id),
+    FOREIGN KEY (claim_id) REFERENCES Claims(claim_id),
+    FOREIGN KEY (vessel_id) REFERENCES Vessels(vessel_id)
+);
+
+
+CREATE TABLE GraphCheckpoints (
+    checkpoint_id INT AUTO_INCREMENT PRIMARY KEY,
+
+    run_id VARCHAR(100) NOT NULL,
+    checkpoint_version INT NOT NULL,
+
+    current_state VARCHAR(100) NOT NULL,
+    status VARCHAR(50) NOT NULL,
+
+    state_json JSON NOT NULL,
+
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (run_id)
+        REFERENCES GraphRuns(run_id)
+        ON DELETE CASCADE,
+
+    UNIQUE KEY unique_run_checkpoint (
+        run_id,
+        checkpoint_version
+    )
 );
