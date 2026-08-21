@@ -58,12 +58,15 @@ class EnvironmentFeedback:
 ALLOWED_VESSEL_TYPES = {"cargo", "tanker", "passenger", "fishing", "yacht"}
 REQUIRED_SYNTHESIS_TERMS = {"premium", "eligib", "document", "vessel", "policy"}
 REQUIRED_MCP_KEYS = {
-    "get_customer_policies":          {"policies"},
+    "get_customer_policies":          {"policy_id", "status"},
     "check_vessel_eligibility":       {"eligible"},
-    "estimate_policy_premium_change": {"estimated_change", "new_premium"},
-    "get_policy_update_requirements": {"requirements"},
+    "estimate_policy_premium_change": {"current_premium", "estimated_additional_premium", "estimated_new_premium"},
+    "get_policy_update_requirements": {"required_documents"},
     "get_policy_coverage":            {"coverage"},
+    "apply_cancellation_rules":       {"allowed", "refund_amount"},
+    "get_vessel":                     {"vessel_id", "vessel_name"},
 }
+
 
 
 # ---------------------------------------------------------------------------
@@ -131,12 +134,33 @@ def _check_mcp_tool_result(tool_name: str, result: Any) -> tuple[bool, list[str]
         return True, [], [f"No schema check for tool '{tool_name}'"]
 
     expected = REQUIRED_MCP_KEYS[tool_name]
-    if isinstance(result, dict):
+    parsed_result = result
+    if isinstance(parsed_result, str):
+        try:
+            import json
+            parsed_result = json.loads(parsed_result)
+        except Exception:
+            pass
+
+    if isinstance(parsed_result, dict):
         for key in expected:
-            if key in result:
+            if key in parsed_result:
                 passed.append(f"Key '{key}' present in MCP result")
             else:
                 issues.append(f"Expected key '{key}' missing from {tool_name} result")
+    elif isinstance(parsed_result, list):
+        if len(parsed_result) == 0:
+            passed.append(f"Empty list result from {tool_name} (valid lookup)")
+        else:
+            first_item = parsed_result[0]
+            if isinstance(first_item, dict):
+                for key in expected:
+                    if key in first_item:
+                        passed.append(f"Key '{key}' present in list item of MCP result")
+                    else:
+                        issues.append(f"Expected key '{key}' missing from {tool_name} list items")
+            else:
+                passed.append(f"List returned for {tool_name}")
     elif isinstance(result, str):
         for key in expected:
             if key.lower() in result.lower():
@@ -147,6 +171,7 @@ def _check_mcp_tool_result(tool_name: str, result: Any) -> tuple[bool, list[str]
         issues.append(f"MCP result is not a dict or string (type: {type(result).__name__})")
 
     return len(issues) == 0, issues, passed
+
 
 
 # ---------------------------------------------------------------------------

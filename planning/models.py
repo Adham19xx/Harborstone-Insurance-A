@@ -8,10 +8,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 ALLOWED_MCP_TOOLS = {
     "get_customer_policies",
     "get_policy_coverage",
+    "get_vessel",
     "check_vessel_eligibility",
     "estimate_policy_premium_change",
     "get_policy_update_requirements",
+    "apply_cancellation_rules",
 }
+
 
 
 class Task(BaseModel):
