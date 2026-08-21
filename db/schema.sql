@@ -121,3 +121,25 @@ CREATE TABLE GraphCheckpoints (
         checkpoint_version
     )
 );
+
+CREATE TABLE IF NOT EXISTS FailureTickets (
+    ticket_id VARCHAR(100) PRIMARY KEY,
+    run_id VARCHAR(100) NOT NULL,
+    graph_name VARCHAR(100) NOT NULL,
+    failed_node VARCHAR(100) NOT NULL,
+    failure_type VARCHAR(50) NOT NULL,
+    error_message TEXT NOT NULL,
+    checkpoint_version INT NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'OPEN',
+    recovery_attempts INT NOT NULL DEFAULT 0,
+    resolution_note TEXT NULL,
+    metadata JSON NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (run_id)
+        REFERENCES GraphRuns(run_id)
+        ON DELETE CASCADE
+);
+
