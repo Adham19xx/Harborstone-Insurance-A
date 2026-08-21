@@ -177,3 +177,20 @@ class SemanticStore:
             f for f in self.facts
             if f.get("entity") == entity
         ]
+
+    def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Retrieve relevant active facts matching keywords in query."""
+        active_facts = self.get_active_facts()
+        if not query:
+            return active_facts[:top_k]
+
+        terms = [t.lower() for t in query.split() if len(t) > 2]
+        scored = []
+        for fact in active_facts:
+            text = f"{fact.get('entity', '')} {fact.get('attribute', '')} {str(fact.get('value', ''))}".lower()
+            matches = sum(1 for term in terms if term in text)
+            if matches > 0:
+                scored.append((matches, fact))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [f for _, f in scored[:top_k]]
