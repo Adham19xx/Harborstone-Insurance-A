@@ -4,8 +4,10 @@ from typing import Any, Dict, Optional
 
 from state_graph.models import GraphState, GraphStatus, GraphEventType
 from state_graph.checkpointing import CheckpointManager
+from state_graph.failure_tickets import TicketManager, FailureType, TicketStatus
 from state_graph.Hitl import HITLManager
 from state_graph.llm_tools import run_task_decomposition, call_mcp_tool_sync, run_constrained_react
+from rag.policy_retriever import PolicyRAGRetriever
 
 
 class HighValueVehicleAdditionGraph:
@@ -18,9 +20,11 @@ class HighValueVehicleAdditionGraph:
     - External waiting for documents
     - External eligibility decisions
     - Cycles for incomplete documents
+    - Task Decomposition (extracting entities/subtasks)
+    - Constrained ReAct (validating vehicle documents)
     - HITL approval for high-value vehicles
-    - Failure handling with ticket creation
-    - Checkpoint-based recovery
+    - Failure handling with persistent FailureTickets
+    - Checkpoint-based recovery (INVESTIGATING → RESOLVED)
     """
 
     GRAPH_NAME = "HIGH_VALUE_VEHICLE_ADDITION"
@@ -33,9 +37,16 @@ class HighValueVehicleAdditionGraph:
     def __init__(
         self,
         checkpoint_manager: CheckpointManager,
+        ticket_manager: Optional[TicketManager] = None,
+        rag_retriever: Optional[Any] = None,
+        llm: Optional[Any] = None,
     ) -> None:
         self.checkpoints = checkpoint_manager
+        self.tickets = ticket_manager or TicketManager()
+        self.rag_retriever = rag_retriever or PolicyRAGRetriever()
         self.hitl_manager = HITLManager(checkpoint_manager)
+        self.llm = llm
+
 
     # ==========================================================
     # START
@@ -85,10 +96,12 @@ class HighValueVehicleAdditionGraph:
         
         # Use Task Decomposition LLM pattern to extract complex vehicle data
         extracted_details = run_task_decomposition(
-            "Extract structured vehicle information from raw customer input",
-            str(vehicle_details)
+            "Extract structured vehicle information and subtasks from customer input",
+            str(vehicle_details),
+            llm=self.llm,
         )
         state.data["extracted_vehicle_details"] = extracted_details
+
 
         self._checkpoint(state)
 
@@ -242,10 +255,15 @@ class HighValueVehicleAdditionGraph:
         # Use Constrained ReAct LLM Agent to validate the authenticity and completeness of documents
         llm_validation = run_constrained_react(
             "Validate vehicle documents including proof of ownership, registration, and valuation",
-            {"evidence": documents}
+            {"evidence": documents},
+            llm=self.llm,
+            required_keys={"proof_of_ownership", "vehicle_registration", "valuation_report"},
         )
         complete = llm_validation.get("is_valid", False)
         state.data["document_validation_reasoning"] = llm_validation.get("reasoning", "")
+        state.data["verified_documents"] = llm_validation.get("verified_items", [])
+        state.data["missing_documents"] = llm_validation.get("missing_items", [])
+
 
         if not complete:
             attempts = state.data.get("document_attempts", 0) + 1
@@ -490,32 +508,47 @@ class HighValueVehicleAdditionGraph:
         return state
 
     # ==========================================================
-    # FAILURE / TICKET
+    # FAILURE
     # ==========================================================
 
     def handle_failure(
         self,
         state: GraphState,
         error_message: str,
-        ticket_id: str,
+        ticket_id: Optional[str] = None,
+        failure_type: str = "UNEXPECTED_ERROR",
+        failed_node: Optional[str] = None,
     ) -> GraphState:
         """
-        Handle an unexpected failure.
-
-        The failure is different from HITL:
-        - HITL = expected business pause.
-        - Failure = unexpected technical/external problem.
-
-        The latest successful checkpoint remains available for recovery.
+        Handle an unexpected failure:
+        1. Capture failed node and safe checkpoint version
+        2. Create / persist failure ticket
+        3. Mark state FAILED with ticket metadata
+        4. Save durable checkpoint
         """
+        current_node = failed_node or state.current_state
+        checkpoint_ver = state.checkpoint_version
 
-        state.data["failure_ticket_id"] = ticket_id
+        ticket = self.tickets.create_ticket(
+            run_id=state.run_id,
+            graph_name=self.GRAPH_NAME,
+            failed_node=current_node,
+            failure_type=failure_type,
+            error_message=error_message,
+            checkpoint_version=checkpoint_ver,
+            ticket_id=ticket_id or state.data.get("failure_ticket_id"),
+            metadata={"data_snapshot": state.data.copy(), "status": state.status.value},
+        )
+
+        state.data["failure_ticket_id"] = ticket.ticket_id
 
         state.mark_failed(
             error_message,
             metadata={
-                "ticket_id": ticket_id,
-                "failure_type": "UNEXPECTED_FAILURE",
+                "ticket_id": ticket.ticket_id,
+                "failure_type": ticket.failure_type.value if hasattr(ticket.failure_type, "value") else str(ticket.failure_type),
+                "failed_node": current_node,
+                "checkpoint_version": checkpoint_ver,
             },
         )
 
@@ -540,12 +573,40 @@ class HighValueVehicleAdditionGraph:
         if state is None:
             return None
 
-        if state.status == GraphStatus.FAILED:
-            state.mark_running(
-                message="Run recovered from the latest checkpoint."
+        return state
+
+    # ==========================================================
+    # RESUME AFTER FAILURE
+    # ==========================================================
+
+    def resume_after_failure(
+        self,
+        state: GraphState,
+    ) -> GraphState:
+        """
+        Resume execution from the last checkpoint after failure resolution.
+        Moves ticket lifecycle: OPEN → INVESTIGATING.
+        """
+
+        if state.status != GraphStatus.FAILED:
+            raise ValueError(
+                "Only FAILED runs can be resumed through resume_after_failure()."
             )
 
-            self._checkpoint(state)
+        ticket_id = state.data.get("failure_ticket_id")
+        if ticket_id:
+            self.tickets.start_investigation(ticket_id)
+        else:
+            latest_t = self.tickets.get_latest_ticket_for_run(state.run_id)
+            if latest_t:
+                ticket_id = latest_t.ticket_id
+                self.tickets.start_investigation(ticket_id)
+
+        state.mark_running(
+            message="Failure investigating/resolved; resuming from the latest checkpoint."
+        )
+
+        self._checkpoint(state)
 
         return state
 

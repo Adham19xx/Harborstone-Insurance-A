@@ -8,8 +8,10 @@ from state_graph.models import (
     GraphEventType,
 )
 from state_graph.checkpointing import CheckpointManager
+from state_graph.failure_tickets import TicketManager, FailureType, TicketStatus
 from state_graph.Hitl import HITLManager
 from state_graph.llm_tools import run_constrained_react, call_mcp_tool_sync
+from rag.policy_retriever import PolicyRAGRetriever
 
 
 class AutoInsuranceClaimGraph:
@@ -29,11 +31,11 @@ class AutoInsuranceClaimGraph:
           ↓
         AWAITING_EVIDENCE
           ↓
-        VALIDATE_EVIDENCE
+        VALIDATE_EVIDENCE (Constrained ReAct)
           ├── incomplete → REQUEST_EVIDENCE ↺
           └── complete
                   ↓
-             ASSESS_CLAIM
+             ASSESS_CLAIM (RAG + MCP)
                   ↓
           CALCULATE_SETTLEMENT
                   ↓
@@ -56,11 +58,11 @@ class AutoInsuranceClaimGraph:
            ↓
         FAILED
            ↓
-        Ticket created
+        Persistent Ticket created (OPEN)
            ↓
         Checkpoint preserved
            ↓
-        Recovery / Resume
+        Recovery / Resume (INVESTIGATING → RESOLVED)
     """
 
     GRAPH_NAME = "AUTO_INSURANCE_CLAIM"
@@ -72,10 +74,17 @@ class AutoInsuranceClaimGraph:
         self,
         checkpoint_manager: CheckpointManager,
         semantic_store: Optional[Any] = None,
+        rag_retriever: Optional[Any] = None,
+        ticket_manager: Optional[TicketManager] = None,
+        llm: Optional[Any] = None,
     ) -> None:
         self.checkpoints = checkpoint_manager
         self.semantic_store = semantic_store
+        self.rag_retriever = rag_retriever or (PolicyRAGRetriever() if semantic_store is None else semantic_store)
+        self.tickets = ticket_manager or TicketManager()
         self.hitl_manager = HITLManager(checkpoint_manager)
+        self.llm = llm
+
 
     # ==========================================================
     # START
@@ -207,12 +216,17 @@ class AutoInsuranceClaimGraph:
         # Use Constrained ReAct Agent to validate evidence instead of static checks
         llm_result = run_constrained_react(
             "Validate claim evidence documents to ensure all required items are present",
-            {"evidence": evidence}
+            {"evidence": evidence},
+            llm=self.llm,
+            required_keys={"accident_photos", "police_report", "repair_report"},
         )
         complete = llm_result.get("is_valid", False)
         
         # Save LLM reasoning to state
         state.data["validation_reasoning"] = llm_result.get("reasoning", "")
+        state.data["verified_evidence"] = llm_result.get("verified_items", [])
+        state.data["missing_evidence"] = llm_result.get("missing_items", [])
+
 
         # ======================================================
         # EXTERNAL BRANCH
@@ -331,23 +345,28 @@ class AutoInsuranceClaimGraph:
             )
 
         # ------------------------------------------------------
-        # Optional policy context retrieval
+        # Real RAG policy context retrieval
         # ------------------------------------------------------
 
         policy_context = None
-
-        if self.semantic_store is not None:
+        retriever = self.rag_retriever or self.semantic_store
+        if retriever is not None:
             try:
-                policy_context = self.semantic_store.retrieve(
-                    query=(
-                        f"Auto insurance coverage for "
-                        f"{claim_details.get('type', 'claim')}"
+                if hasattr(retriever, "retrieve"):
+                    policy_context = retriever.retrieve(
+                        query=(
+                            f"Auto insurance coverage for "
+                            f"{claim_details.get('type', 'claim')}"
+                        )
                     )
-                )
+                elif hasattr(retriever, "similarity_search"):
+                    chunks = retriever.similarity_search(
+                        f"Auto insurance coverage for {claim_details.get('type', 'claim')}"
+                    )
+                    policy_context = "\n\n".join(c.get("content", "") for c in chunks)
             except Exception:
-                # RAG/semantic retrieval must not silently decide
-                # the business outcome.
                 policy_context = None
+
 
         # ------------------------------------------------------
         # External/deterministic coverage result
@@ -551,26 +570,40 @@ class AutoInsuranceClaimGraph:
         self,
         state: GraphState,
         error_message: str,
-        ticket_id: str,
+        ticket_id: Optional[str] = None,
+        failure_type: str = "UNEXPECTED_ERROR",
+        failed_node: Optional[str] = None,
     ) -> GraphState:
         """
-        Handle an unexpected failure.
-
-        Failure is different from HITL:
-        - HITL = expected business pause.
-        - Failure = unexpected technical/external problem.
-
-        The current state is preserved through checkpointing,
-        allowing later recovery.
+        Handle an unexpected failure:
+        1. Capture failed node and safe checkpoint version
+        2. Create / persist failure ticket
+        3. Mark state FAILED with ticket metadata
+        4. Save durable checkpoint
         """
+        current_node = failed_node or state.current_state
+        checkpoint_ver = state.checkpoint_version
 
-        state.data["failure_ticket_id"] = ticket_id
+        ticket = self.tickets.create_ticket(
+            run_id=state.run_id,
+            graph_name=self.GRAPH_NAME,
+            failed_node=current_node,
+            failure_type=failure_type,
+            error_message=error_message,
+            checkpoint_version=checkpoint_ver,
+            ticket_id=ticket_id or state.data.get("failure_ticket_id"),
+            metadata={"data_snapshot": state.data.copy(), "status": state.status.value},
+        )
+
+        state.data["failure_ticket_id"] = ticket.ticket_id
 
         state.mark_failed(
             error_message,
             metadata={
-                "ticket_id": ticket_id,
-                "failure_type": "UNEXPECTED_FAILURE",
+                "ticket_id": ticket.ticket_id,
+                "failure_type": ticket.failure_type.value if hasattr(ticket.failure_type, "value") else str(ticket.failure_type),
+                "failed_node": current_node,
+                "checkpoint_version": checkpoint_ver,
             },
         )
 
@@ -609,6 +642,7 @@ class AutoInsuranceClaimGraph:
         Resume execution from the last checkpoint after
         the external/technical failure has been resolved.
 
+        Moves ticket lifecycle: OPEN → INVESTIGATING.
         The graph does not restart from START.
         """
 
@@ -618,9 +652,18 @@ class AutoInsuranceClaimGraph:
                 "resume_after_failure()."
             )
 
+        ticket_id = state.data.get("failure_ticket_id")
+        if ticket_id:
+            self.tickets.start_investigation(ticket_id)
+        else:
+            latest_t = self.tickets.get_latest_ticket_for_run(state.run_id)
+            if latest_t:
+                ticket_id = latest_t.ticket_id
+                self.tickets.start_investigation(ticket_id)
+
         state.mark_running(
             message=(
-                "Failure resolved; resuming from the "
+                "Failure investigating/resolved; resuming from the "
                 "latest checkpoint."
             )
         )
@@ -628,6 +671,7 @@ class AutoInsuranceClaimGraph:
         self._checkpoint(state)
 
         return state
+
 
     # ==========================================================
     # HELPERS

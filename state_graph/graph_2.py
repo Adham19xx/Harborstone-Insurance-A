@@ -8,8 +8,10 @@ from state_graph.models import (
     GraphEventType,
 )
 from state_graph.checkpointing import CheckpointManager
+from state_graph.failure_tickets import TicketManager, FailureType, TicketStatus
 from state_graph.Hitl import HITLManager
 from state_graph.llm_tools import run_tree_of_thoughts, call_mcp_tool_sync
+from rag.policy_retriever import PolicyRAGRetriever
 
 
 class PolicyCancellationGraph:
@@ -25,11 +27,11 @@ class PolicyCancellationGraph:
           ↓
         GET_POLICY
           ↓
-        CHECK_CANCELLATION_RULES
+        CHECK_CANCELLATION_RULES (RAG + MCP)
           ↓
         CALCULATE_FINANCIAL_IMPACT
           ↓
-        PRESENT_OPTIONS
+        PRESENT_OPTIONS (Tree of Thoughts)
           ↓
         AWAITING_CUSTOMER_DECISION
              │
@@ -57,8 +59,8 @@ class PolicyCancellationGraph:
                      ↓
              AWAITING_CUSTOMER_DECISION ↺
 
-    Unexpected failures are persisted and can be recovered
-    from the latest checkpoint.
+    Unexpected failures are persisted in FailureTickets and recovered
+    from the latest checkpoint (INVESTIGATING → RESOLVED).
     """
 
     GRAPH_NAME = "POLICY_CANCELLATION_RETENTION"
@@ -70,10 +72,17 @@ class PolicyCancellationGraph:
         self,
         checkpoint_manager: CheckpointManager,
         semantic_store: Optional[Any] = None,
+        rag_retriever: Optional[Any] = None,
+        ticket_manager: Optional[TicketManager] = None,
+        llm: Optional[Any] = None,
     ) -> None:
         self.checkpoints = checkpoint_manager
         self.semantic_store = semantic_store
+        self.rag_retriever = rag_retriever or (PolicyRAGRetriever() if semantic_store is None else semantic_store)
+        self.tickets = ticket_manager or TicketManager()
         self.hitl_manager = HITLManager(checkpoint_manager)
+        self.llm = llm
+
 
     # ==========================================================
     # START
@@ -133,13 +142,18 @@ class PolicyCancellationGraph:
             {"policy_id": getattr(state, "policy_id", 0)}
         )
         
-        # Use RAG (Semantic Store) to retrieve the official cancellation policy text
+        # Use RAG to retrieve the official cancellation policy text
         policy_context = None
-        if self.semantic_store:
+        retriever = self.rag_retriever or self.semantic_store
+        if retriever:
             try:
-                policy_context = self.semantic_store.retrieve(
-                    query="What are the cancellation and refund rules for marine policies?"
-                )
+                if hasattr(retriever, "retrieve"):
+                    policy_context = retriever.retrieve(
+                        query="What are the cancellation and refund rules for marine policies?"
+                    )
+                elif hasattr(retriever, "similarity_search"):
+                    chunks = retriever.similarity_search("What are the cancellation and refund rules for marine policies?")
+                    policy_context = "\n\n".join(c.get("content", "") for c in chunks)
             except Exception:
                 pass
                 
@@ -171,10 +185,17 @@ class PolicyCancellationGraph:
         
         # Use Tree of Thoughts LLM pattern to evaluate and present the best retention options
         tot_options = run_tree_of_thoughts(
-            "Determine the best retention options for the customer based on their history",
-            {"customer_id": getattr(state, "customer_id", 0), "policy_id": getattr(state, "policy_id", 0)}
+            "Determine the best retention options for the customer based on their history and policy rules",
+            {
+                "customer_id": getattr(state, "customer_id", 0),
+                "policy_id": getattr(state, "policy_id", 0),
+                "policy_context": policy_context,
+                "cancellation_rules": mcp_rules,
+            },
+            llm=self.llm,
         )
         state.data["generated_retention_options"] = tot_options
+
         
         self._checkpoint(state)
 
@@ -794,23 +815,40 @@ class PolicyCancellationGraph:
         self,
         state: GraphState,
         error_message: str,
-        ticket_id: str,
+        ticket_id: Optional[str] = None,
+        failure_type: str = "UNEXPECTED_ERROR",
+        failed_node: Optional[str] = None,
     ) -> GraphState:
         """
-        Handle an unexpected technical/external failure.
-
-        This is different from HITL:
-            HITL    = expected business decision.
-            FAILURE = unexpected system/external problem.
+        Handle an unexpected technical/external failure:
+        1. Capture failed node and safe checkpoint version
+        2. Create / persist failure ticket
+        3. Mark state FAILED with ticket metadata
+        4. Save durable checkpoint
         """
+        current_node = failed_node or state.current_state
+        checkpoint_ver = state.checkpoint_version
 
-        state.data["failure_ticket_id"] = ticket_id
+        ticket = self.tickets.create_ticket(
+            run_id=state.run_id,
+            graph_name=self.GRAPH_NAME,
+            failed_node=current_node,
+            failure_type=failure_type,
+            error_message=error_message,
+            checkpoint_version=checkpoint_ver,
+            ticket_id=ticket_id or state.data.get("failure_ticket_id"),
+            metadata={"data_snapshot": state.data.copy(), "status": state.status.value},
+        )
+
+        state.data["failure_ticket_id"] = ticket.ticket_id
 
         state.mark_failed(
             error_message,
             metadata={
-                "ticket_id": ticket_id,
-                "failure_type": "UNEXPECTED_FAILURE",
+                "ticket_id": ticket.ticket_id,
+                "failure_type": ticket.failure_type.value if hasattr(ticket.failure_type, "value") else str(ticket.failure_type),
+                "failed_node": current_node,
+                "checkpoint_version": checkpoint_ver,
             },
         )
 
@@ -844,6 +882,7 @@ class PolicyCancellationGraph:
     ) -> GraphState:
         """
         Resume a failed workflow from its latest checkpoint.
+        Moves ticket lifecycle: OPEN → INVESTIGATING.
         """
 
         if state.status != GraphStatus.FAILED:
@@ -851,9 +890,18 @@ class PolicyCancellationGraph:
                 "Only FAILED runs can be resumed."
             )
 
+        ticket_id = state.data.get("failure_ticket_id")
+        if ticket_id:
+            self.tickets.start_investigation(ticket_id)
+        else:
+            latest_t = self.tickets.get_latest_ticket_for_run(state.run_id)
+            if latest_t:
+                ticket_id = latest_t.ticket_id
+                self.tickets.start_investigation(ticket_id)
+
         state.mark_running(
             message=(
-                "Failure resolved; resuming from "
+                "Failure investigating/resolved; resuming from "
                 "the latest checkpoint."
             )
         )
@@ -861,6 +909,7 @@ class PolicyCancellationGraph:
         self._checkpoint(state)
 
         return state
+
 
     # ==========================================================
     # HELPERS

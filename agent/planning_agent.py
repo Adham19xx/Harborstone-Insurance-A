@@ -136,27 +136,29 @@ class PlanningAgent:
         trace = RunTrace(method=f"subtask_{method}", request_id=task_id, goal=instruction)
 
         if method == "PS":
-            res = plan_and_solve(instruction, context, self.llm, trace)
-            return {"method": "PS", "routing": routing.model_dump(), "result": res.model_dump()}
+            res = plan_and_solve(instruction, self.llm, task_id=task_id, context=context)
+            return {"method": "PS", "routing": routing.model_dump(), "result": res.__dict__ if hasattr(res, "__dict__") else str(res)}
 
         elif method == "ToT":
-            res = tree_of_thoughts_search(instruction, context, search_strategy="BFS", llm=self.llm, trace=trace)
-            return {"method": "ToT", "routing": routing.model_dump(), "result": res.model_dump()}
+            res = tree_of_thoughts_search(instruction, self.llm, task_id=task_id, context=context)
+            return {"method": "ToT", "routing": routing.model_dump(), "result": res.__dict__ if hasattr(res, "__dict__") else str(res)}
 
         elif method == "LATS":
-            res = lats_search(instruction, context, self.environment, llm=self.llm, trace=trace)
-            return {"method": "LATS", "routing": routing.model_dump(), "result": res.model_dump()}
+            res = lats_search(instruction, self.llm, self.environment, task_id=task_id, context=context)
+            return {"method": "LATS", "routing": routing.model_dump(), "result": res.__dict__ if hasattr(res, "__dict__") else str(res)}
 
         elif method == "SELF_REFINE":
-            res = self_refine(instruction, context, self.llm, trace)
-            return {"method": "SELF_REFINE", "routing": routing.model_dump(), "result": res.model_dump()}
+            draft = str(context.get("draft", instruction) if isinstance(context, dict) else context)
+            res = self_refine(instruction, draft, self.llm, task_id=task_id, context=str(context))
+            return {"method": "SELF_REFINE", "routing": routing.model_dump(), "result": res.__dict__ if hasattr(res, "__dict__") else str(res)}
 
         elif method == "REFLEXION":
-            res = run_reflexion(instruction, context, self.environment, llm=self.llm, trace=trace)
-            return {"method": "REFLEXION", "routing": routing.model_dump(), "result": res.model_dump()}
+            res = run_reflexion(instruction, self.llm, self.environment, task_id=task_id, context=str(context))
+            return {"method": "REFLEXION", "routing": routing.model_dump(), "result": res.__dict__ if hasattr(res, "__dict__") else str(res)}
 
         else:
             return {"method": method, "routing": routing.model_dump(), "result": "Direct execution"}
+
 
 
 if __name__ == "__main__":
